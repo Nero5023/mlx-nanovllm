@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "Learning to build an LLM inference engine with MLX"
 requires-python = ">=3.12"
 dependencies = [
-    "huggingface-hub==1.9.0",
+    "huggingface-hub==1.9.1",
     "mlx==0.31.1",
-    "mlx-lm==0.31.1",
+    "mlx-lm==0.31.2",
     "transformers==5.5.0",
 ]
 

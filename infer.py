@@ -3,29 +3,34 @@
 import argparse
 import sys
 from pathlib import Path
+from typing import cast
 
 import mlx.core as mx
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import KVCache, make_prompt_cache
+from mlx_lm.models.qwen3 import Model as Qwen3Model
 from mlx_lm.utils import load_model
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 
-DEFAULT_MODEL = Path(__file__).parent / "models" / "Qwen3-0.6B-4bit"
+DEFAULT_MODEL: Path = Path(__file__).parent / "models" / "Qwen3-0.6B-4bit"
 
 
-def encode_prompt(tokenizer, text: str) -> list[int]:
+def encode_prompt(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
     # Like nano-vllm/example.py: format the chat before encoding it.
-    prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": text}],
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
+    prompt: str = cast(
+        str,  # A single conversation with tokenize=False returns text.
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        ),
     )
     return tokenizer.encode(prompt, add_special_tokens=False)
 
 
 def generate_tokens(
-    model,
+    model: Qwen3Model,
     prompt_ids: list[int],
     eos_token_ids: set[int],
     max_tokens: int = 128,
@@ -40,18 +45,19 @@ def generate_tokens(
         raise ValueError("max_tokens must be nonnegative.")
 
     # Each request gets a fresh cache, with one K/V pair per transformer layer.
-    cache = make_prompt_cache(model) if use_cache else None
-    inputs = mx.array([prompt_ids], dtype=mx.int32)  # [batch=1, sequence]
-    generated = []
+    cache: list[KVCache] | None = make_prompt_cache(model) if use_cache else None
+    inputs: mx.array = mx.array([prompt_ids], dtype=mx.int32)  # [batch=1, sequence]
+    generated: list[int] = []
 
     for step in range(max_tokens):
-        logits = model(inputs, cache=cache)  # [1, sequence, vocabulary]
-        next_token = mx.argmax(logits[:, -1, :], axis=-1)
-        token_id = next_token.item()  # MLX is lazy; reading the scalar evaluates it.
+        logits: mx.array = model(inputs, cache=cache)  # [1, sequence, vocabulary]
+        next_token: mx.array = mx.argmax(logits[:, -1, :], axis=-1)
+        # argmax returns an integer; reading the scalar evaluates MLX's lazy graph.
+        token_id: int = cast(int, next_token.item())
 
         if trace:
-            phase = "prefill" if step == 0 else "decode" if use_cache else "full"
-            cached_tokens = cache[0].offset if cache is not None else 0
+            phase: str = "prefill" if step == 0 else "decode" if use_cache else "full"
+            cached_tokens: int = cache[0].offset if cache is not None else 0
             print(
                 f"{phase:7} input={inputs.shape} logits={logits.shape} "
                 f"cached={cached_tokens} next={token_id}",
@@ -71,14 +77,14 @@ def generate_tokens(
     return generated
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main() -> None:
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prompt", nargs="?", default="What is the capital of France?")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--no-cache", action="store_true", help="Recompute the full prefix.")
     parser.add_argument("--trace", action="store_true", help="Print shapes and cache length.")
-    args = parser.parse_args()
+    args: argparse.Namespace = parser.parse_args()
     if args.max_tokens < 0:
         parser.error("--max-tokens must be nonnegative")
     if not (args.model / "config.json").is_file():
@@ -86,16 +92,21 @@ def main():
 
     # MLX-LM provides the Qwen3 architecture and quantized weight loading.
     # Transformers provides only the tokenizer; all model computation uses MLX.
-    model, config = load_model(args.model)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-    prompt_ids = encode_prompt(tokenizer, args.prompt)
+    loaded_model, config = load_model(args.model)
+    model: Qwen3Model = cast(Qwen3Model, loaded_model)
+    tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+        args.model, local_files_only=True
+    )
+    prompt_ids: list[int] = encode_prompt(tokenizer, args.prompt)
     if len(prompt_ids) + args.max_tokens > config["max_position_embeddings"]:
         parser.error("Prompt plus requested output exceeds the model's context length.")
 
-    eos = config["eos_token_id"]
-    eos_token_ids = set(eos if isinstance(eos, list) else [eos])
-    eos_token_ids.add(tokenizer.eos_token_id)
-    generated = generate_tokens(
+    eos: int | list[int] = config["eos_token_id"]
+    eos_token_ids: set[int] = set(eos if isinstance(eos, list) else [eos])
+    tokenizer_eos: int | None = cast(int | None, tokenizer.eos_token_id)
+    if tokenizer_eos is not None:
+        eos_token_ids.add(tokenizer_eos)
+    generated: list[int] = generate_tokens(
         model,
         prompt_ids,
         eos_token_ids,
