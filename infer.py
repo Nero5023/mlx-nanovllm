@@ -31,7 +31,7 @@ def encode_prompt(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
 
 def generate_tokens(
     model: Qwen3Model,
-    prompt_ids: list[int],
+    prompt_token_ids: list[int],
     eos_token_ids: set[int],
     max_tokens: int = 128,
     *,
@@ -39,14 +39,14 @@ def generate_tokens(
     trace: bool = False,
 ) -> list[int]:
     """Return new token IDs, excluding the prompt and the stop token."""
-    if not prompt_ids:
+    if not prompt_token_ids:
         raise ValueError("The prompt must contain at least one token.")
     if max_tokens < 0:
         raise ValueError("max_tokens must be nonnegative.")
 
     # Each request gets a fresh cache, with one K/V pair per transformer layer.
     cache: list[KVCache] | None = make_prompt_cache(model) if use_cache else None
-    inputs: mx.array = mx.array([prompt_ids], dtype=mx.int32)  # [batch=1, sequence]
+    inputs: mx.array = mx.array([prompt_token_ids], dtype=mx.int32)  # [batch=1, sequence]
     generated: list[int] = []
 
     for step in range(max_tokens):
@@ -72,7 +72,7 @@ def generate_tokens(
         if use_cache:
             inputs = mx.array([[token_id]], dtype=mx.int32)
         else:
-            inputs = mx.array([prompt_ids + generated], dtype=mx.int32)
+            inputs = mx.array([prompt_token_ids + generated], dtype=mx.int32)
 
     return generated
 
@@ -97,8 +97,8 @@ def main() -> None:
     tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
         args.model, local_files_only=True
     )
-    prompt_ids: list[int] = encode_prompt(tokenizer, args.prompt)
-    if len(prompt_ids) + args.max_tokens > config["max_position_embeddings"]:
+    prompt_token_ids: list[int] = encode_prompt(tokenizer, args.prompt)
+    if len(prompt_token_ids) + args.max_tokens > config["max_position_embeddings"]:
         parser.error("Prompt plus requested output exceeds the model's context length.")
 
     eos: int | list[int] = config["eos_token_id"]
@@ -108,7 +108,7 @@ def main() -> None:
         eos_token_ids.add(tokenizer_eos)
     generated: list[int] = generate_tokens(
         model,
-        prompt_ids,
+        prompt_token_ids,
         eos_token_ids,
         args.max_tokens,
         use_cache=not args.no_cache,
