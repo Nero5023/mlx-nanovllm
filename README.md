@@ -34,6 +34,13 @@ Start with `encode_prompt()` and `generate_tokens()` in `infer.py`:
 4. **Decode:** pass just that new token, reusing the cache. Stop at EOS or the
    token budget. Decode the collected output IDs into text.
 
+`sampler.py` defines the `Sampler` abstract base class and `GreedySampler`.
+Its `sample()` method receives `[batch, vocabulary]` logits and returns an
+integer MLX array of shape `[batch]` containing the selected token IDs.
+`generate_tokens()` creates a fresh `GreedySampler` by default. To change token
+selection, subclass `Sampler`, implement `sample()`, and pass an instance such
+as `sampler=MySampler()`; the generation loop and cache handling stay the same.
+
 `--trace` shows `[batch, input length]`, `[batch, input length, vocabulary]`,
 the number of tokens cached per layer, and the selected token ID. The selected
 token enters the cache on the *following* forward pass.

@@ -11,6 +11,8 @@ from mlx_lm.models.qwen3 import Model as Qwen3Model
 from mlx_lm.utils import load_model
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from sampler import GreedySampler, Sampler
+
 
 DEFAULT_MODEL: Path = Path(__file__).parent / "models" / "Qwen3-0.6B-4bit"
 
@@ -35,14 +37,22 @@ def generate_tokens(
     eos_token_ids: set[int],
     max_tokens: int = 128,
     *,
+    sampler: Sampler | None = None,
     use_cache: bool = True,
     trace: bool = False,
 ) -> list[int]:
-    """Return new token IDs, excluding the prompt and the stop token."""
+    """Return new token IDs, excluding the prompt and the stop token.
+
+    Sampler.sample receives [batch, vocabulary] logits and returns [batch] integer
+    token IDs. Defaults to a fresh GreedySampler. The loop handles batch=1.
+    """
     if not prompt_token_ids:
         raise ValueError("The prompt must contain at least one token.")
     if max_tokens < 0:
         raise ValueError("max_tokens must be nonnegative.")
+
+    if sampler is None:
+        sampler = GreedySampler()
 
     # Each request gets a fresh cache, with one K/V pair per transformer layer.
     cache: list[KVCache] | None = make_prompt_cache(model) if use_cache else None
@@ -51,8 +61,8 @@ def generate_tokens(
 
     for step in range(max_tokens):
         logits: mx.array = model(inputs, cache=cache)  # [1, sequence, vocabulary]
-        next_token: mx.array = mx.argmax(logits[:, -1, :], axis=-1)
-        # argmax returns an integer; reading the scalar evaluates MLX's lazy graph.
+        next_token: mx.array = sampler.sample(logits[:, -1, :])
+        # Reading the selected token ID evaluates MLX's lazy graph.
         token_id: int = cast(int, next_token.item())
 
         if trace:
