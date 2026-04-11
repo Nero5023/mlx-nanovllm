@@ -3,6 +3,10 @@
 Learning LLM inference on Apple Silicon, using `../nano-vllm` as a reference.
 The first milestone handles one prompt with greedy decoding and a KV cache.
 
+The [v0.1 milestone report](reports/v0.1/README.md) archives the Qwen3-0.6B
+inference baseline, environment, and benchmark result. Code and report are tagged
+`v0.1` together.
+
 ## Run
 
 ```bash
@@ -22,6 +26,37 @@ uv run hf download mlx-community/Qwen3-0.6B-4bit \
 
 Inference loads local files and runs on MLX. It does not need a network connection.
 The weights use 4-bit quantization; the KV cache uses the model's activation dtype.
+
+## Small benchmark
+
+```bash
+uv run python infer.py "Count from 1 to 100, separated by commas." \
+  --max-tokens 128 --benchmark
+```
+
+This prints metrics and saves them to `benchmarks/latest.json` (overwritten each
+run, ignored by Git). Supply a path to retain separate measurements, for example
+`--benchmark benchmarks/cached.json`. Add `--no-cache` to compare full-prefix
+recomputation; the JSON records whether caching was enabled.
+
+- `prompt_tokens`: tokenized input length, including the chat template.
+- `generated_tokens`: actual returned output length, excluding EOS.
+- Prefill tok/s: prompt length divided by the first forward pass and token
+  selection time. This pass also produces the first output token.
+- Decode tok/s: subsequent forward-pass count (`decode_steps`) divided by their
+  total compute and selection time. An EOS prediction counts as a step even
+  though it is excluded from the returned output. Without EOS, generating N
+  tokens takes N-1 decode steps. With `--no-cache`, each step recomputes the prefix.
+- `peak_memory_gb`: MLX's peak used memory during the measured request, including
+  resident model weights and KV cache, in decimal GB. This is not process RSS or
+  total system memory. Model-loading and warmup peaks are excluded.
+
+The benchmark first runs up to two unmeasured tokens (prefill and one decode)
+using a separate cache. It then measures one request. Timers include `.item()`
+and GPU synchronization so lazy computation finishes before timing ends. Model
+loading, tokenization, input-array assembly, trace printing, and text decoding
+are outside the timed regions. A phase with no steps reports `null` throughput.
+This is a small local measurement; repeated runs can vary.
 
 ## Read the loop
 

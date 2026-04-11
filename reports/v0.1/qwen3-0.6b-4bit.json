@@ -1,0 +1,31 @@
+{
+  "version": "0.1",
+  "git_tag": "v0.1",
+  "milestone": "Single-prompt Qwen3-0.6B 4-bit inference on MLX with greedy decoding, KV caching, and benchmark reporting",
+  "model_repo": "mlx-community/Qwen3-0.6B-4bit",
+  "model_revision": "73e3e38d981303bc594367cd910ea6eb48349da8",
+  "environment": {
+    "chip": "Apple M4",
+    "unified_memory_bytes": 17179869184,
+    "os": "macOS",
+    "architecture": "arm64",
+    "python": "3.12.12"
+  },
+  "run": {
+    "model": "models/Qwen3-0.6B-4bit",
+    "prompt": "Count from 1 to 100, separated by commas.",
+    "max_tokens": 128,
+    "use_cache": true,
+    "sampler": "GreedySampler",
+    "warmup_tokens": 2,
+    "prompt_tokens": 26,
+    "generated_tokens": 128,
+    "decode_steps": 127,
+    "prefill_seconds": 0.026060292031615973,
+    "decode_seconds": 0.8668390496168286,
+    "peak_memory_bytes": 571457844,
+    "prefill_tokens_per_second": 997.6864406759976,
+    "decode_tokens_per_second": 146.50932033592417,
+    "peak_memory_gb": 0.571457844
+  }
+}
