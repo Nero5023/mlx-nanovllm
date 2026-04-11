@@ -7,8 +7,8 @@ The [v0.1 milestone report](reports/v0.1/README.md) archives the Qwen3-0.6B
 inference baseline, environment, and benchmark result. Code and report are tagged
 `v0.1` together.
 
-The next step adds a synchronous FIFO engine that reuses one loaded model and
-finishes each request before starting the next.
+The engine reuses one loaded model and finishes each request before starting
+the next. An async client can now submit more requests while the worker is busy.
 
 ## Run
 
@@ -30,7 +30,70 @@ uv run hf download mlx-community/Qwen3-0.6B-4bit \
 Inference loads local files and runs on MLX. It does not need a network connection.
 The weights use 4-bit quantization; the KV cache uses the model's activation dtype.
 
-## Multiple requests, one at a time
+## Async clients and one worker
+
+```bash
+uv run python async_example.py
+```
+
+```python
+import asyncio
+from client import InferenceClient
+
+async def main() -> None:
+    async with InferenceClient() as client:
+        first = client.submit("What is the capital of France?", max_tokens=32)
+        second = client.submit("What is 2 + 2?", max_tokens=16)
+        for output in await asyncio.gather(first, second):
+            print(output.request_id, output.text)
+
+asyncio.run(main())
+```
+
+`client.py` runs on the asyncio event loop. `submit()` enqueues raw text and
+immediately returns an awaitable future; `await client.generate(...)` is a
+convenience for submitting and awaiting one result. Multiple coroutines share
+one client. They can submit while an earlier request is generating.
+
+`worker.py` owns a thread-safe FIFO queue and one dedicated thread. That thread
+loads the model/tokenizer once, tokenizes each request, and calls the synchronous
+engine's `add_request()` and `run_next()`. Every model operation stays on this
+thread. Results and exceptions cross back through `concurrent.futures.Future`
+and `asyncio.wrap_future`; the worker never modifies an asyncio future directly.
+
+```text
+async clients -> thread-safe queue -> one model-owning worker thread
+      ^                                  |
+      +---------- per-request future ----+
+```
+
+`async_example.py` submits B and C shortly after A. Its timestamps show them
+arriving while A runs, then completing in order. Displayed latency includes
+queueing and execution; this is an in-process example with whole-response output.
+
+Use `async with` to manage the worker. Exiting stops submissions, drains accepted
+requests, and joins the thread without blocking the event loop. Each request's
+exception goes to its own waiter, and later requests continue. Cancelling a
+future can skip work that has not started; it cannot interrupt active inference.
+After active inference finishes, its cancelled waiter discards the result.
+Each client belongs to one event loop and is closed permanently on exit.
+
+The client accepts the same `use_cache`, `trace`, and `collect_stats` options as
+the engine, and each submission can specify a sampler. Pass a separate sampler
+instance per request when it keeps mutable state. There is no automatic warmup;
+the existing benchmark command provides warmed measurements.
+
+Run the queue and concurrency checks with:
+
+```bash
+uv run python -m unittest -v test_engine test_client
+```
+
+These tests use a stand-in engine with real threads/futures, including blocked
+inference, FIFO delivery, cancellation, failures, and shutdown. The async example
+runs the real Qwen model.
+
+## Synchronous engine
 
 ```bash
 uv run python example.py
