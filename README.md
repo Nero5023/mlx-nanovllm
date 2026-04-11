@@ -7,6 +7,9 @@ The [v0.1 milestone report](reports/v0.1/README.md) archives the Qwen3-0.6B
 inference baseline, environment, and benchmark result. Code and report are tagged
 `v0.1` together.
 
+The next step adds a synchronous FIFO engine that reuses one loaded model and
+finishes each request before starting the next.
+
 ## Run
 
 ```bash
@@ -26,6 +29,46 @@ uv run hf download mlx-community/Qwen3-0.6B-4bit \
 
 Inference loads local files and runs on MLX. It does not need a network connection.
 The weights use 4-bit quantization; the KV cache uses the model's activation dtype.
+
+## Multiple requests, one at a time
+
+```bash
+uv run python example.py
+```
+
+```python
+from engine import InferenceEngine
+
+engine = InferenceEngine()  # Load model and tokenizer once.
+first_id = engine.add_request("What is the capital of France?", max_tokens=32)
+second_id = engine.add_request("What is 2 + 2?", max_tokens=16)
+
+for output in engine.run():
+    print(output.request_id, output.text)
+```
+
+`add_request()` tokenizes, validates, and appends a request to the queue.
+`run_next()` removes the oldest request and runs its entire generation before
+returning a `RequestOutput`; it returns `None` when the queue is empty. `run()`
+drains the queue and returns outputs in submission order. You can add more
+requests after a run and reuse the same engine; IDs increase within that engine.
+
+Each request has its own token budget and sampler (`sampler=MySampler()`). A
+fresh greedy sampler is used by default. Model weights and tokenizer are shared;
+the KV cache and output tokens are created anew for every request. This is a
+single-threaded Python interface with one active request and no interleaving.
+Invalid requests are rejected before enqueueing. If inference raises an error,
+it propagates; the failed request is removed and later requests remain queued.
+
+Read `request.py` for the request/output data, `engine.py` for queue management,
+and `infer.py` for the generation loop. `pending_requests` gives the queue length.
+The engine also accepts `use_cache=False`, `trace=True`, and `collect_stats=True`.
+With statistics enabled, each output has its own `BenchmarkStats`; these include
+the first request's cold-start costs because the engine does not run a warmup.
+Use the benchmark command below for a warmed measurement.
+
+Run queue behavior checks with `uv run python -m unittest -v test_engine`.
+These use stand-ins for model loading and generation; `example.py` runs the real model.
 
 ## Small benchmark
 
