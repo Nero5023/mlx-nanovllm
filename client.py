@@ -8,6 +8,7 @@ from typing import Self
 from infer import DEFAULT_MODEL
 from request import RequestOutput
 from sampler import Sampler
+from telemetry import MemorySnapshot, TokenCallback, TokenEvent
 from worker import InferenceWorker
 
 
@@ -47,22 +48,54 @@ class InferenceClient:
         self._started = True
 
     def submit(
-        self, prompt: str, max_tokens: int = 128, *, sampler: Sampler | None = None
+        self, prompt: str, max_tokens: int = 128, *, sampler: Sampler | None = None,
+        on_token: TokenCallback | None = None, ignore_eos: bool = False,
     ) -> asyncio.Future[RequestOutput]:
-        """Return immediately with an awaitable result for this request."""
+        """Return immediately; optional token callbacks run on the client's event loop.
+
+        Keep callbacks quick: slow callbacks delay this loop's observations.
+        ignore_eos is useful for fixed-output-length benchmark workloads.
+        """
+        loop: asyncio.AbstractEventLoop = self._running_loop()
+
+        def deliver(event: TokenEvent) -> None:
+            if not result.cancelled() and on_token is not None:
+                on_token(event)
+
+        def from_worker(event: TokenEvent) -> None:
+            loop.call_soon_threadsafe(deliver, event)
+
+        # wrap_future delivers thread-safe worker results onto the asyncio loop.
+        result: asyncio.Future[RequestOutput] = asyncio.wrap_future(
+            self._worker.submit(
+                prompt, max_tokens, sampler=sampler,
+                on_token=from_worker if on_token is not None else None,
+                ignore_eos=ignore_eos,
+            ), loop=loop,
+        )
+        return result
+
+    def _running_loop(self) -> asyncio.AbstractEventLoop:
         if self._closed or not self._started:
             raise RuntimeError("Start the client with 'async with' before submitting.")
-        if asyncio.get_running_loop() is not self._loop:
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        if loop is not self._loop:
             raise RuntimeError("Use this client from its original event loop.")
-        # wrap_future delivers thread-safe worker results onto the asyncio loop.
-        return asyncio.wrap_future(
-            self._worker.submit(prompt, max_tokens, sampler=sampler), loop=self._loop
-        )
+        return loop
 
     async def generate(
-        self, prompt: str, max_tokens: int = 128, *, sampler: Sampler | None = None
+        self, prompt: str, max_tokens: int = 128, *, sampler: Sampler | None = None,
+        on_token: TokenCallback | None = None, ignore_eos: bool = False,
     ) -> RequestOutput:
-        return await self.submit(prompt, max_tokens, sampler=sampler)
+        return await self.submit(
+            prompt, max_tokens, sampler=sampler, on_token=on_token, ignore_eos=ignore_eos
+        )
+
+    async def memory_snapshot(self, *, reset_peak: bool = False) -> MemorySnapshot:
+        loop: asyncio.AbstractEventLoop = self._running_loop()
+        return await asyncio.wrap_future(
+            self._worker.memory_snapshot(reset_peak=reset_peak), loop=loop
+        )
 
     async def close(self) -> None:
         """Gracefully finish accepted work without blocking the event loop."""

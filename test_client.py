@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import unittest
+from time import perf_counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from client import InferenceClient
 from request import RequestOutput
 from sampler import Sampler
+from telemetry import TokenCallback, TokenEvent
 
 
 @dataclass
@@ -32,12 +34,15 @@ class FakeEngine:
             raise TimeoutError("Test did not release model loading.")
         self.next_id: int = 0
         self.pending: tuple[int, str] | None = None
+        self.on_token: TokenCallback | None = None
 
     def add_request(
-        self, prompt: str, max_tokens: int, *, sampler: Sampler | None
+        self, prompt: str, max_tokens: int, *, sampler: Sampler | None,
+        on_token: TokenCallback | None = None, ignore_eos: bool = False,
     ) -> int:
         self.state.thread_ids.append(threading.get_ident())
         self.pending = (self.next_id, prompt)
+        self.on_token = on_token
         self.next_id += 1
         return self.next_id - 1
 
@@ -53,6 +58,8 @@ class FakeEngine:
                 raise TimeoutError("Test did not release inference.")
         if prompt == "error":
             raise ValueError("request failed")
+        if self.on_token is not None:
+            self.on_token(TokenEvent(request_id, perf_counter()))
         return RequestOutput(request_id, prompt, f"answer:{prompt}", [request_id], None)
 
 
@@ -102,6 +109,45 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
                 await failed
             self.assertEqual((await succeeding).text, "answer:success")
             self.assertEqual((await client.generate("later")).text, "answer:later")
+
+    async def test_tokens_arrive_on_client_loop_before_completion(self) -> None:
+        events: list[TokenEvent] = []
+        callback_threads: list[int] = []
+
+        def receive(event: TokenEvent) -> None:
+            events.append(event)
+            callback_threads.append(threading.get_ident())
+
+        async with InferenceClient() as client:
+            output = await client.generate("stream", on_token=receive)
+        self.assertEqual([event.token_id for event in events], output.token_ids)
+        self.assertEqual(callback_threads, [threading.get_ident()])
+        assert output.timing is not None
+        self.assertLessEqual(output.timing.enqueued_at, output.timing.started_at)
+        self.assertLessEqual(output.timing.started_at, events[0].generated_at)
+        self.assertLessEqual(events[0].generated_at, output.timing.finished_at)
+
+    async def test_memory_probe_runs_on_worker_and_resets_only_when_requested(self) -> None:
+        probe_threads: list[int] = []
+
+        def synchronize() -> None:
+            probe_threads.append(threading.get_ident())
+
+        with (
+            patch("worker.mx.synchronize", side_effect=synchronize),
+            patch("worker.mx.reset_peak_memory") as reset,
+            patch("worker.mx.get_peak_memory", return_value=200),
+            patch("worker.mx.get_active_memory", return_value=100),
+            patch("worker.mx.get_cache_memory", return_value=50),
+        ):
+            async with InferenceClient() as client:
+                await client.memory_snapshot(reset_peak=True)
+                await client.generate("one")
+                snapshot = await client.memory_snapshot()
+            reset.assert_called_once()
+        self.assertEqual(snapshot.peak_bytes, 200)
+        self.assertEqual(snapshot.allocator_cache_bytes, 50)
+        self.assertEqual(probe_threads, [self.state.thread_ids[0]] * 2)
 
     async def test_cancel_queued_and_running_waiters(self) -> None:
         async with InferenceClient() as client:

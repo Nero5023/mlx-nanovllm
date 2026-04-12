@@ -15,6 +15,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from benchmark import BenchmarkStats
 from sampler import GreedySampler, Sampler
+from telemetry import TokenCallback, TokenEvent
 
 
 DEFAULT_MODEL: Path = Path(__file__).parent / "models" / "Qwen3-0.6B-4bit"
@@ -44,6 +45,7 @@ def generate_tokens(
     use_cache: bool = True,
     trace: bool = False,
     stats: BenchmarkStats | None = None,
+    on_token: TokenCallback | None = None,
 ) -> list[int]:
     """Return new token IDs, excluding the prompt and the stop token.
 
@@ -97,6 +99,8 @@ def generate_tokens(
         if token_id in eos_token_ids:
             break
         generated.append(token_id)
+        if on_token is not None:
+            on_token(TokenEvent(token_id, perf_counter()))
 
         # After prefill, the cache already holds the earlier tokens' K and V.
         if use_cache:

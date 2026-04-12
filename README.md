@@ -83,6 +83,12 @@ the engine, and each submission can specify a sampler. Pass a separate sampler
 instance per request when it keeps mutable state. There is no automatic warmup;
 the existing benchmark command provides warmed measurements.
 
+Pass `on_token=callback` to observe each generated token on the client's event
+loop. The callback receives a `TokenEvent(token_id, generated_at)`; keep it quick.
+Awaiting the returned future still gives the complete `RequestOutput`, now with
+prompt length and worker queue/start/finish timestamps. `ignore_eos=True` is an
+opt-in fixed-output-budget mode for benchmarks; ordinary requests stop at EOS.
+
 Run the queue and concurrency checks with:
 
 ```bash
@@ -134,6 +140,17 @@ Run queue behavior checks with `uv run python -m unittest -v test_engine`.
 These use stand-ins for model loading and generation; `example.py` runs the real model.
 
 ## Small benchmark
+
+For multi-request TTFT, inter-token latency, total throughput, and peak memory,
+use the [serving benchmark suite](BENCHMARKS.md):
+
+```bash
+uv run python bench.py --profile full --repeats 3
+```
+
+It saves raw observations and a report under `benchmarks/`, with workloads for
+the upcoming fixed-batch, continuous-batch, prefix-reuse, and paging milestones.
+The smaller command below remains useful for inspecting one inference loop.
 
 ```bash
 uv run python infer.py "Count from 1 to 100, separated by commas." \

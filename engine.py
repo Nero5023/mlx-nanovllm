@@ -12,6 +12,7 @@ from benchmark import BenchmarkStats
 from infer import DEFAULT_MODEL, encode_prompt, generate_tokens
 from request import Request, RequestOutput
 from sampler import GreedySampler, Sampler
+from telemetry import TokenCallback
 
 
 class InferenceEngine:
@@ -57,6 +58,8 @@ class InferenceEngine:
         max_tokens: int = 128,
         *,
         sampler: Sampler | None = None,
+        on_token: TokenCallback | None = None,
+        ignore_eos: bool = False,
     ) -> int:
         """Validate and queue a prompt; return its ID without running inference."""
         if max_tokens < 0:
@@ -73,6 +76,8 @@ class InferenceEngine:
             prompt_token_ids=prompt_token_ids,
             max_tokens=max_tokens,
             sampler=sampler if sampler is not None else GreedySampler(),
+            on_token=on_token,
+            ignore_eos=ignore_eos,
         )
         self._waiting.append(request)
         self._next_request_id += 1
@@ -92,12 +97,13 @@ class InferenceEngine:
         token_ids: list[int] = generate_tokens(
             self.model,
             request.prompt_token_ids,
-            self.eos_token_ids,
+            set() if request.ignore_eos else self.eos_token_ids,
             request.max_tokens,
             sampler=request.sampler,
             use_cache=self.use_cache,
             trace=self.trace,
             stats=stats,
+            on_token=request.on_token,
         )
         text: str = cast(str, self.tokenizer.decode(token_ids, skip_special_tokens=True))
         return RequestOutput(
@@ -106,6 +112,7 @@ class InferenceEngine:
             text=text,
             token_ids=token_ids,
             stats=stats,
+            prompt_tokens=len(request.prompt_token_ids),
         )
 
     def run(self) -> list[RequestOutput]:

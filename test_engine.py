@@ -72,6 +72,17 @@ class InferenceEngineTests(unittest.TestCase):
         self.assertEqual(outputs[0].token_ids, [])
         self.assertEqual(self.generator.call_args.args[3], 0)
 
+    def test_ignore_eos_is_opt_in(self) -> None:
+        self.engine.add_request("normal", max_tokens=1)
+        output = self.engine.run()[0]
+        self.assertEqual(self.generator.call_args.args[2], {9})
+        self.assertEqual(output.prompt_tokens, 2)
+        callback: MagicMock = MagicMock()
+        self.engine.add_request("fixed budget", max_tokens=1, ignore_eos=True, on_token=callback)
+        self.engine.run()
+        self.assertEqual(self.generator.call_args.args[2], set())
+        self.assertIs(self.generator.call_args.kwargs["on_token"], callback)
+
     def test_invalid_requests_leave_queue_unchanged(self) -> None:
         first_id: int = self.engine.add_request("valid", max_tokens=1)
         with self.assertRaises(ValueError):

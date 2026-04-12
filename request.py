@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from benchmark import BenchmarkStats
 from sampler import Sampler
+from telemetry import RequestTiming, TokenCallback
 
 
 @dataclass(frozen=True)
@@ -13,6 +14,8 @@ class Request:
     prompt_token_ids: list[int]
     max_tokens: int
     sampler: Sampler
+    on_token: TokenCallback | None = None
+    ignore_eos: bool = False
 
 
 @dataclass(frozen=True)
@@ -22,3 +25,5 @@ class RequestOutput:
     text: str
     token_ids: list[int]
     stats: BenchmarkStats | None
+    prompt_tokens: int = 0
+    timing: RequestTiming | None = None
