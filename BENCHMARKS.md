@@ -1,13 +1,16 @@
 # Serving benchmark
 
-This suite measures the async client → FIFO worker path on the local Qwen model.
-It currently has **one active request**, with no batching, cross-request prefix
-reuse, or paged KV cache. Workloads stay separate from the backend so we can use
-the same requests as those features are implemented.
+This suite measures the async client → worker path on the local Qwen model.
+The default is **one active request**; `--batch-size N` enables fixed batches.
+There is no continuous batching, cross-request prefix reuse, or paged KV cache.
+Workloads stay separate from scheduling so the same requests compare each stage.
 
 ```bash
 # All main scenarios, three repeats each.
 uv run python bench.py --output benchmarks/fifo-baseline
+
+# Same workloads, fixed groups of at most four. Default collection wait: 2 ms.
+uv run python bench.py --batch-size 4 --output benchmarks/fixed-batch-4
 
 # Add adjacent-length cases for allocation/kernel changes.
 uv run python bench.py --profile full --repeats 3 \
@@ -19,7 +22,7 @@ uv run python bench.py --case burst-1 --case burst-4
 uv run python bench.py --max-concurrency 8 --max-prompt-tokens 4096
 uv run python bench.py --case single --no-cache
 
-uv run python -m unittest -v test_engine test_client test_bench
+uv run python -m unittest -v test_engine test_client test_bench test_batch_infer
 ```
 
 Output directories contain `summary.md` and `results.json`. Existing results
@@ -61,6 +64,13 @@ Per-repeat values remain available to see variation. Three repeats and short
 bursts are useful for development; their tail percentiles are descriptive,
 not a production SLO or a steady-state capacity measurement.
 
+The report records both client concurrency and **actual execution batch sizes**.
+Four in-flight requests can form smaller batches if their arrivals are staggered.
+`--batch-wait-ms` bounds the collection wait (default 2 ms) and contributes to
+queue time. Fixed batches never refill during generation. Finished rows stop
+emitting tokens, but their final response waits for the whole batch; E2E latency
+therefore includes this wait. Per-request timing includes the execution batch ID.
+
 MLX's [peak-memory counter](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.get_peak_memory.html)
 excludes unused buffers retained in the allocator cache. We record allocator
 cache bytes separately at case boundaries. These are not process RSS or total
@@ -82,6 +92,19 @@ compare equivalent commands/workloads when assessing regressions.
 | Paging / context memory | `context-*`, `context-burst` | Context-length sweep and simultaneous long-context requests. Compare active memory and latency at identical input/output work. |
 | Allocation / kernel optimization | `boundary-127/128/129`, `255/256/257`, `511/512/513` in `full` | Nearby lengths and decode growth across boundaries. These are probes, not a claim about a future engine's page size; add the actual page/kernel boundaries when known. |
 
+With fixed batching enabled, preflight checks additionally compare a mixed group
+against serial greedy inference, reverse request order to test row mapping and
+cache isolation, and verify an underfilled batch. Different kernel shapes can
+produce floating-point differences; a token mismatch is reported as a failed
+check for investigation, never silently accepted as correct.
+
+Passing these selected checks does not establish bitwise equality on all prompts.
+In BF16, serial and batched kernels can round nearby logits differently; the
+synthetic performance prompts have exhibited greedy token differences. Fixed
+output budgets still control work, but token-by-token equivalence must be
+reported separately from performance. Investigate first-divergence logits on
+identical histories before attributing a difference to state handling or rounding.
+
 Prompt lengths include the Qwen chat template and are checked against the real
 tokenizer. Synthetic prompts use repeated filler; they control token counts
 but do not represent the diversity of production text. Shared prefix length is
@@ -94,8 +117,12 @@ performs its entire stated output budget; EOS predictions count as generated
 tokens in these cases. Correctness checks use normal EOS behavior. Model load
 is excluded. Each case/repeat gets a fresh client, then an unrelated 128-token,
 4-output-token warmup before measurement. This warms the common inference path,
-not every possible sequence shape. Prefix state starts cold; allocator/kernel
-caches can survive between cases in the same process.
+not every possible sequence shape. After warmup, unused MLX allocator buffers
+are released before resetting the peak and starting the case. Live model/KV
+allocations remain. This prevents a previous large batch's unused buffers from
+dominating later small cases. Prefix state starts cold; compiled kernels can
+survive between cases. `metadata.allocator_policy` records this measurement
+change; rerun the serial baseline with the same policy for timing comparisons.
 
 Burst/staggered cases submit according to the schedule **without waiting for
 earlier responses**. The prefix cases intentionally wait for each response so
@@ -104,8 +131,9 @@ submission lag exposes event-loop stalls; don't silently treat delayed arrivals
 as the intended offered load.
 
 The concurrency sweep is client in-flight requests, **not active GPU batch size**.
-Today queued requests do not yet have KV caches. More queued requests therefore
-cannot demonstrate the memory cost of multiple simultaneously active contexts.
+Queued requests have no KV caches. Active batch rows each occupy KV storage,
+including left padding and finished rows retained until batch completion. The
+serial path's queue memory cannot demonstrate this simultaneous active-context cost.
 The largest successful tested configuration is only a tested bound, not the
 machine's limit. Increase `--max-concurrency` and `--max-prompt-tokens` deliberately;
 this suite does not search until OOM. Throughput is a useful comparison, but
@@ -128,9 +156,9 @@ For each later milestone, preserve the model/tokenizer hashes, sampler, prompt
 IDs, output budgets, arrivals, warmup policy, and environment. Compare each
 request's stored output IDs with this baseline before interpreting speedups;
 the current cache/full-recompute check alone cannot validate a new batch engine.
-Record genuine prefix hits/recomputed tokens, active batch size, and page
-occupancy once those implementations exist. The current benchmark doesn't
-invent those counters. Raw source hashes record the code even before a commit.
+Actual execution batch sizes are now recorded. Add genuine prefix hits/recomputed
+tokens and page occupancy once those implementations exist. Raw source hashes
+record the code even before a commit.
 
 A useful reading exercise: if `burst-4` has nearly unchanged tok/s but much
 higher TTFT than `burst-1`, which part of `queue → prefill → decode` grew?

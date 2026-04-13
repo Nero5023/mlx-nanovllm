@@ -1,0 +1,324 @@
+{
+  "serial_results": "../serial-isolated/results.json",
+  "batch_results": "results.json",
+  "compared_requests": 93,
+  "exact_token_matches": 75,
+  "token_mismatch_requests": 18,
+  "rows": [
+    {
+      "case": "single",
+      "serial_tok_s": 77.33420927446215,
+      "batch_tok_s": 81.16984352329717,
+      "speedup": 1.0495981569452946,
+      "serial_ttft_p50_ms": 108.35283307824284,
+      "batch_ttft_p50_ms": 102.49445796944201,
+      "serial_peak_gb": 0.667091676,
+      "batch_peak_gb": 0.67104042,
+      "actual_batch_sizes": [
+        1
+      ],
+      "token_mismatch_requests": 0
+    },
+    {
+      "case": "burst-1",
+      "serial_tok_s": 79.56427786866824,
+      "batch_tok_s": 81.7585975972078,
+      "speedup": 1.0275792074951222,
+      "serial_ttft_p50_ms": 102.54074994008988,
+      "batch_ttft_p50_ms": 104.37424993142486,
+      "serial_peak_gb": 0.667091676,
+      "batch_peak_gb": 0.67104042,
+      "actual_batch_sizes": [
+        1
+      ],
+      "token_mismatch_requests": 0
+    },
+    {
+      "case": "burst-2",
+      "serial_tok_s": 81.09159211727105,
+      "batch_tok_s": 139.60467336764347,
+      "speedup": 1.72156779417715,
+      "serial_ttft_p50_ms": 497.2018130356446,
+      "batch_ttft_p50_ms": 172.2358955303207,
+      "serial_peak_gb": 0.667091676,
+      "batch_peak_gb": 0.780207748,
+      "actual_batch_sizes": [
+        2
+      ],
+      "token_mismatch_requests": 6
+    },
+    {
+      "case": "burst-4",
+      "serial_tok_s": 81.57502033708019,
+      "batch_tok_s": 211.27305413542086,
+      "speedup": 2.58992340133547,
+      "serial_ttft_p50_ms": 1252.9673330136575,
+      "batch_ttft_p50_ms": 317.14414549060166,
+      "serial_peak_gb": 0.667091676,
+      "batch_peak_gb": 1.027902548,
+      "actual_batch_sizes": [
+        4
+      ],
+      "token_mismatch_requests": 3
+    },
+    {
+      "case": "mixed-burst",
+      "serial_tok_s": 57.41374484622208,
+      "batch_tok_s": 33.52592644710133,
+      "speedup": 0.5839355460421145,
+      "serial_ttft_p50_ms": 2510.6906874570996,
+      "batch_ttft_p50_ms": 2905.2010205341503,
+      "serial_peak_gb": 1.426690208,
+      "batch_peak_gb": 2.582496256,
+      "actual_batch_sizes": [
+        4
+      ],
+      "token_mismatch_requests": 3
+    },
+    {
+      "case": "staggered",
+      "serial_tok_s": 78.03363659891932,
+      "batch_tok_s": 92.18644780622826,
+      "speedup": 1.181368084638323,
+      "serial_ttft_p50_ms": 1620.07729196921,
+      "batch_ttft_p50_ms": 1592.8235619794577,
+      "serial_peak_gb": 0.667091676,
+      "batch_peak_gb": 0.853216112,
+      "actual_batch_sizes": [
+        1,
+        3
+      ],
+      "token_mismatch_requests": 3
+    },
+    {
+      "case": "prefix-shared",
+      "serial_tok_s": 48.11854907358378,
+      "batch_tok_s": 46.79154545665767,
+      "speedup": 0.9724222021969776,
+      "serial_ttft_p50_ms": 296.8267920659855,
+      "batch_ttft_p50_ms": 318.37168749189004,
+      "serial_peak_gb": 0.979601616,
+      "batch_peak_gb": 0.979863904,
+      "actual_batch_sizes": [
+        1
+      ],
+      "token_mismatch_requests": 0
+    },
+    {
+      "case": "prefix-control",
+      "serial_tok_s": 47.92240762044347,
+      "batch_tok_s": 46.148343851668535,
+      "speedup": 0.9629804958293011,
+      "serial_ttft_p50_ms": 296.4804795337841,
+      "batch_ttft_p50_ms": 316.6550419991836,
+      "serial_peak_gb": 0.979601616,
+      "batch_peak_gb": 0.979863904,
+      "actual_batch_sizes": [
+        1
+      ],
+      "token_mismatch_requests": 0
+    },
+    {
+      "case": "context-128",
+      "serial_tok_s": 71.8498742324349,
+      "batch_tok_s": 71.48976857236939,
+      "speedup": 0.9949880822490994,
+      "serial_ttft_p50_ms": 102.08829201292247,
+      "batch_ttft_p50_ms": 105.34058301709592,
+      "serial_peak_gb": 0.667091676,
+      "batch_peak_gb": 0.67104042,
+      "actual_batch_sizes": [
+        1
+      ],
+      "token_mismatch_requests": 0
+    },
+    {
+      "case": "context-512",
+      "serial_tok_s": 45.65193547204639,
+      "batch_tok_s": 46.1527672708643,
+      "speedup": 1.010970658607116,
+      "serial_ttft_p50_ms": 308.02187509834766,
+      "batch_ttft_p50_ms": 320.8397909766063,
+      "serial_peak_gb": 0.979601616,
+      "batch_peak_gb": 0.979863904,
+      "actual_batch_sizes": [
+        1
+      ],
+      "token_mismatch_requests": 0
+    },
+    {
+      "case": "context-2048",
+      "serial_tok_s": 16.468594998140922,
+      "batch_tok_s": 14.305819869605156,
+      "speedup": 0.8686727599543304,
+      "serial_ttft_p50_ms": 1430.298666935414,
+      "batch_ttft_p50_ms": 1748.1361670652404,
+      "serial_peak_gb": 1.838522456,
+      "batch_peak_gb": 1.800773984,
+      "actual_batch_sizes": [
+        1
+      ],
+      "token_mismatch_requests": 0
+    },
+    {
+      "case": "context-burst",
+      "serial_tok_s": 17.02992092239709,
+      "batch_tok_s": 16.708059177817248,
+      "speedup": 0.9811002208379875,
+      "serial_ttft_p50_ms": 4327.0050209830515,
+      "batch_ttft_p50_ms": 6525.395208445843,
+      "serial_peak_gb": 1.838522456,
+      "batch_peak_gb": 4.435346432,
+      "actual_batch_sizes": [
+        4
+      ],
+      "token_mismatch_requests": 3
+    }
+  ],
+  "differences": [
+    {
+      "case": "burst-2",
+      "repeat": 1,
+      "request": "request-0",
+      "first_difference_index": 10,
+      "serial_token": 369,
+      "batch_token": 315
+    },
+    {
+      "case": "burst-2",
+      "repeat": 1,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "burst-2",
+      "repeat": 2,
+      "request": "request-0",
+      "first_difference_index": 10,
+      "serial_token": 369,
+      "batch_token": 315
+    },
+    {
+      "case": "burst-2",
+      "repeat": 2,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "burst-2",
+      "repeat": 3,
+      "request": "request-0",
+      "first_difference_index": 10,
+      "serial_token": 369,
+      "batch_token": 315
+    },
+    {
+      "case": "burst-2",
+      "repeat": 3,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "burst-4",
+      "repeat": 1,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "burst-4",
+      "repeat": 2,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "burst-4",
+      "repeat": 3,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "mixed-burst",
+      "repeat": 1,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "mixed-burst",
+      "repeat": 2,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "mixed-burst",
+      "repeat": 3,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "staggered",
+      "repeat": 1,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "staggered",
+      "repeat": 2,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "staggered",
+      "repeat": 3,
+      "request": "request-1",
+      "first_difference_index": 12,
+      "serial_token": 487,
+      "batch_token": 25
+    },
+    {
+      "case": "context-burst",
+      "repeat": 1,
+      "request": "request-1",
+      "first_difference_index": 7,
+      "serial_token": 13,
+      "batch_token": 11
+    },
+    {
+      "case": "context-burst",
+      "repeat": 2,
+      "request": "request-1",
+      "first_difference_index": 7,
+      "serial_token": 13,
+      "batch_token": 11
+    },
+    {
+      "case": "context-burst",
+      "repeat": 3,
+      "request": "request-1",
+      "first_difference_index": 7,
+      "serial_token": 13,
+      "batch_token": 11
+    }
+  ]
+}

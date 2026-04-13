@@ -18,6 +18,8 @@ class RequestTiming:
     enqueued_at: float
     started_at: float  # Before tokenization, after leaving the worker queue.
     finished_at: float
+    batch_size: int = 1
+    batch_id: int | None = None
 
 
 @dataclass(frozen=True)

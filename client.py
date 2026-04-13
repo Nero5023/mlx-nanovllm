@@ -22,9 +22,12 @@ class InferenceClient:
         use_cache: bool = True,
         trace: bool = False,
         collect_stats: bool = False,
+        max_batch_size: int = 1,
+        batch_wait_ms: float = 2.0,
     ) -> None:
         self._worker: InferenceWorker = InferenceWorker(
-            model_path, use_cache=use_cache, trace=trace, collect_stats=collect_stats
+            model_path, use_cache=use_cache, trace=trace, collect_stats=collect_stats,
+            max_batch_size=max_batch_size, batch_wait_ms=batch_wait_ms,
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._started: bool = False
@@ -91,10 +94,12 @@ class InferenceClient:
             prompt, max_tokens, sampler=sampler, on_token=on_token, ignore_eos=ignore_eos
         )
 
-    async def memory_snapshot(self, *, reset_peak: bool = False) -> MemorySnapshot:
+    async def memory_snapshot(
+        self, *, reset_peak: bool = False, clear_cache: bool = False,
+    ) -> MemorySnapshot:
         loop: asyncio.AbstractEventLoop = self._running_loop()
         return await asyncio.wrap_future(
-            self._worker.memory_snapshot(reset_peak=reset_peak), loop=loop
+            self._worker.memory_snapshot(reset_peak=reset_peak, clear_cache=clear_cache), loop=loop
         )
 
     async def close(self) -> None:

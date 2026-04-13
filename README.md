@@ -7,8 +7,82 @@ The [v0.1 milestone report](reports/v0.1/README.md) archives the Qwen3-0.6B
 inference baseline, environment, and benchmark result. Code and report are tagged
 `v0.1` together.
 
-The engine reuses one loaded model and finishes each request before starting
-the next. An async client can now submit more requests while the worker is busy.
+The `v0.2` tag records the async FIFO worker and serving benchmark baseline.
+The engine now also supports fixed batches: several requests share each model
+forward pass, and later arrivals wait until the current batch finishes.
+
+## Fixed batches
+
+The [fixed-batching benchmark archive](reports/fixed-batching/README.md) records
+the serial comparison, raw observations, and BF16 numerical differences.
+
+```bash
+uv run python batch_example.py
+uv run python bench.py --batch-size 4 --repeats 3
+```
+
+```python
+async with InferenceClient(max_batch_size=4, batch_wait_ms=2.0) as client:
+    outputs = await asyncio.gather(
+        client.generate("What is the capital of France?", max_tokens=24),
+        client.generate("Count from 1 to 20.", max_tokens=64),
+    )
+```
+
+The existing `submit()` / `generate()` API is unchanged. Set `max_batch_size`
+to enable batching; its default of 1 retains the serial path. Before starting
+a batch, the worker collects up to that many FIFO requests, waiting at most
+`batch_wait_ms` for more arrivals. A partial batch runs when the wait expires;
+there is no requirement to fill every slot. Set the wait to 0 to collect only
+already queued work. Collection wait is included in queue time and TTFT.
+
+Start reading [batch_infer.py](batch_infer.py). `generate_batch_tokens()`:
+
+1. Left-pads the prompts to `[batch, longest_prompt]`. Each row's final position
+   is a real prompt token, so `logits[:, -1, :]` selects the correct next scores.
+2. Uses MLX-LM's `BatchKVCache` to mask padding and keep each row's RoPE offset.
+   Padding must not count as real context; for lengths `[3, 1]`, padding is
+   `[0, 2]` and initial offsets are `[0, -2]`. After prefill offsets are `[3, 1]`.
+3. Runs one forward pass per step. Greedy sampling selects one token per row;
+   `.tolist()` evaluates the batch once. Decode input is `[batch, 1]`.
+4. Tracks each row's EOS, output budget, sampler and token callback independently.
+   Completed rows retain their KV and feed dummy tokens, without emitting more
+   output. Batch membership stays fixed until all rows finish.
+
+`engine.run_batch(N)` removes up to N already queued requests and calls this
+loop. `worker.py` forms groups from async submissions; it never adds a new row
+while a batch is generating. Token callbacks arrive during generation, but final
+request futures all complete at the end of their batch. This deliberately makes
+the long/short-request cost visible before we implement continuous batching.
+
+`RequestOutput.timing` records actual `batch_size` and a `batch_id` (the first
+request ID in that group). These show whether simultaneous clients actually
+formed a model batch. Invalid requests fail individually before model execution;
+a shared inference failure fails the selected batch, and later batches continue.
+Cancellation skips a request before admission; after admission its row remains
+until batch completion. Memory probes and shutdown are FIFO barriers.
+
+This stage requires KV caching and `collect_stats=False` when batching is
+enabled. Per-request compute/memory stats cannot attribute shared batch work;
+use `bench.py` for client latency and case-level memory. Padded rows consume
+memory and compute, so similar prompt/output lengths are the simplest first
+comparison. No active-row removal, slot refill, or prefix sharing is implemented.
+
+```bash
+uv run python -m unittest -v test_engine test_client test_bench test_batch_infer
+```
+
+The tests cover fixed membership, partial batches, failure/cancellation/shutdown,
+individual EOS/budgets, padding, and real tiny-Qwen prefill/decode logits compared
+with unpadded serial inference. The benchmark also compares real model output
+token IDs for mixed lengths/budgets, reordered batches, and a partial batch.
+
+Batch and serial execution can use different numerical kernels. With 4-bit
+weights and BF16 activations, close logits can round to a tie and change greedy
+token IDs even when padding and KV handling are correct. The implementation
+preserves the model's original precision; exact output equivalence for every
+prompt is not guaranteed. Keep strict regression checks on their test cases,
+and inspect logits at the first divergence when comparing other workloads.
 
 ## Run
 
@@ -55,7 +129,7 @@ immediately returns an awaitable future; `await client.generate(...)` is a
 convenience for submitting and awaiting one result. Multiple coroutines share
 one client. They can submit while an earlier request is generating.
 
-`worker.py` owns a thread-safe FIFO queue and one dedicated thread. That thread
+With the default batch size of 1, `worker.py` owns a thread-safe FIFO queue and one dedicated thread. That thread
 loads the model/tokenizer once, tokenizes each request, and calls the synchronous
 engine's `add_request()` and `run_next()`. Every model operation stays on this
 thread. Results and exceptions cross back through `concurrent.futures.Future`
@@ -121,11 +195,13 @@ for output in engine.run():
 returning a `RequestOutput`; it returns `None` when the queue is empty. `run()`
 drains the queue and returns outputs in submission order. You can add more
 requests after a run and reuse the same engine; IDs increase within that engine.
+Use `run_batch(N)` instead to finish up to N queued requests together.
 
 Each request has its own token budget and sampler (`sampler=MySampler()`). A
 fresh greedy sampler is used by default. Model weights and tokenizer are shared;
-the KV cache and output tokens are created anew for every request. This is a
-single-threaded Python interface with one active request and no interleaving.
+the KV cache and output tokens are created anew for every request or fixed batch.
+This is a synchronous Python interface: `run_next()` runs one request and
+`run_batch(N)` runs a fixed group, without admitting new work during execution.
 Invalid requests are rejected before enqueueing. If inference raises an error,
 it propagates; the failed request is removed and later requests remain queued.
 

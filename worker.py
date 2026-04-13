@@ -1,7 +1,9 @@
-"""One dedicated model-owning thread, a FIFO queue, and thread-safe futures."""
+"""One model-owning thread serving FIFO requests individually or in fixed batches."""
 
 from concurrent.futures import Future
+from collections import deque
 from dataclasses import dataclass, replace
+from math import isfinite
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread
@@ -31,6 +33,7 @@ class _WorkItem:
 class _MemoryProbe:
     reset_peak: bool
     future: Future[MemorySnapshot]
+    clear_cache: bool = False
 
 
 class InferenceWorker:
@@ -41,7 +44,17 @@ class InferenceWorker:
         use_cache: bool = True,
         trace: bool = False,
         collect_stats: bool = False,
+        max_batch_size: int = 1,
+        batch_wait_ms: float = 2.0,
     ) -> None:
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive.")
+        if not isfinite(batch_wait_ms) or batch_wait_ms < 0:
+            raise ValueError("batch_wait_ms must be finite and nonnegative.")
+        if max_batch_size > 1 and (not use_cache or collect_stats):
+            raise ValueError("Fixed batches require use_cache=True and collect_stats=False.")
+        self._max_batch_size: int = max_batch_size
+        self._batch_wait_seconds: float = batch_wait_ms / 1000
         self._queue: Queue[_WorkItem | _MemoryProbe | None] = Queue()
         self._ready: Future[None] = Future()
         self._lock: Lock = Lock()
@@ -85,13 +98,15 @@ class InferenceWorker:
             ))
             return future
 
-    def memory_snapshot(self, *, reset_peak: bool = False) -> Future[MemorySnapshot]:
+    def memory_snapshot(
+        self, *, reset_peak: bool = False, clear_cache: bool = False,
+    ) -> Future[MemorySnapshot]:
         """Measure on the model thread, after earlier queued requests complete."""
         with self._lock:
             if self._closed or not self._started:
                 raise RuntimeError("Worker must be started and open before measuring.")
             future: Future[MemorySnapshot] = Future()
-            self._queue.put_nowait(_MemoryProbe(reset_peak, future))
+            self._queue.put_nowait(_MemoryProbe(reset_peak, future, clear_cache))
             return future
 
     def close(self) -> None:
@@ -132,13 +147,23 @@ class InferenceWorker:
             return
         self._ready.set_result(None)
 
-        while (item := self._queue.get()) is not None:
-            # Cancellation can skip queued work, but cannot interrupt a running model.
-            if not item.future.set_running_or_notify_cancel():
+        # A control message encountered while collecting a batch is a FIFO barrier.
+        deferred: deque[_MemoryProbe | None] = deque()
+        while True:
+            item: _WorkItem | _MemoryProbe | None = (
+                deferred.popleft() if deferred else self._queue.get()
+            )
+            if item is None:
+                return
+            if item.future.cancelled():
                 continue
             if isinstance(item, _MemoryProbe):
+                if not item.future.set_running_or_notify_cancel():
+                    continue
                 try:
                     mx.synchronize()
+                    if item.clear_cache:
+                        mx.clear_cache()  # Release unused allocator buffers, not live KV/weights.
                     if item.reset_peak:
                         mx.reset_peak_memory()
                     item.future.set_result(MemorySnapshot(
@@ -149,18 +174,59 @@ class InferenceWorker:
                 except BaseException as error:
                     item.future.set_exception(error)
                 continue
-            started_at: float = perf_counter()
+
+            items: list[_WorkItem] = [item]
+            deadline: float = perf_counter() + self._batch_wait_seconds
+            while len(items) < self._max_batch_size:
+                try:
+                    following: _WorkItem | _MemoryProbe | None = self._queue.get(
+                        timeout=max(0.0, deadline - perf_counter())
+                    )
+                except Empty:
+                    break  # Partial batches must make progress even with one client.
+                if not isinstance(following, _WorkItem):
+                    deferred.append(following)
+                    break
+                if not following.future.cancelled():
+                    items.append(following)
+            self._run_requests(engine, items)
+
+    def _run_requests(self, engine: InferenceEngine, items: list[_WorkItem]) -> None:
+        running: list[_WorkItem] = []
+        started_at: float = perf_counter()
+        for item in items:
+            # Cancel before admission: skip. Once admitted, cancellation only
+            # discards its result; the row stays in this fixed batch.
+            if not item.future.set_running_or_notify_cancel():
+                continue
             try:
                 engine.add_request(
                     item.prompt, item.max_tokens, sampler=item.sampler,
                     on_token=item.on_token, ignore_eos=item.ignore_eos,
                 )
-                output: RequestOutput | None = engine.run_next()
-                if output is None:
-                    raise RuntimeError("The submitted request produced no result.")
             except BaseException as error:
                 item.future.set_exception(error)
             else:
+                running.append(item)
+        if not running:
+            return
+        try:
+            outputs: list[RequestOutput]
+            if self._max_batch_size == 1:
+                output: RequestOutput | None = engine.run_next()
+                outputs = [output] if output is not None else []
+            else:
+                outputs = engine.run_batch(len(running))
+            if len(outputs) != len(running):
+                raise RuntimeError("The submitted requests produced an incomplete batch.")
+        except BaseException as error:
+            # A shared model failure affects this batch; later batches can still run.
+            for item in running:
+                item.future.set_exception(error)
+        else:
+            finished_at: float = perf_counter()
+            for item, output in zip(running, outputs, strict=True):
                 item.future.set_result(replace(output, timing=RequestTiming(
-                    item.enqueued_at, started_at, perf_counter()
+                    item.enqueued_at, started_at, finished_at,
+                    batch_size=len(running), batch_id=outputs[0].request_id,
                 )))

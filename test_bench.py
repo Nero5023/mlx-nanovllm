@@ -73,7 +73,9 @@ class FakeBackend:
         self.completed: list[str] = []
         self.memory_resets: list[bool] = []
 
-    async def memory_snapshot(self, *, reset_peak: bool = False) -> MemorySnapshot:
+    async def memory_snapshot(
+        self, *, reset_peak: bool = False, clear_cache: bool = False,
+    ) -> MemorySnapshot:
         self.memory_resets.append(reset_peak)
         return MemorySnapshot(200, 100, 50)
 

@@ -100,6 +100,9 @@ def summarize(observations: list[Observation]) -> dict[str, object]:
         "output_tokens_per_second": output_tokens / duration if duration > 0 else None,
         "requests_per_second": len(successful) / duration if duration > 0 else None,
         "max_client_inflight": max_inflight,
+        "actual_batch_sizes": sorted({item.timing.batch_size for item in successful if item.timing}),
+        "completed_batches": len({item.timing.batch_id for item in successful
+                                  if item.timing and item.timing.batch_id is not None}),
         **distributions,
         "itl_ms": distribution([gap for item in successful for gap in intervals_ms(item.received_at)]),
         "worker_itl_ms": distribution([

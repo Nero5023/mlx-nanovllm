@@ -22,6 +22,7 @@ class EngineState:
     loaded: threading.Event = field(default_factory=threading.Event)
     block_loading: bool = False
     calls: list[str] = field(default_factory=list)
+    batches: list[list[str]] = field(default_factory=list)
     thread_ids: list[int] = field(default_factory=list)
 
 
@@ -33,24 +34,32 @@ class FakeEngine:
         if state.block_loading and not state.loaded.wait(timeout=5):
             raise TimeoutError("Test did not release model loading.")
         self.next_id: int = 0
-        self.pending: tuple[int, str] | None = None
-        self.on_token: TokenCallback | None = None
+        self.waiting: list[tuple[int, str, TokenCallback | None]] = []
 
     def add_request(
         self, prompt: str, max_tokens: int, *, sampler: Sampler | None,
         on_token: TokenCallback | None = None, ignore_eos: bool = False,
     ) -> int:
         self.state.thread_ids.append(threading.get_ident())
-        self.pending = (self.next_id, prompt)
-        self.on_token = on_token
+        if max_tokens < 0:
+            raise ValueError("negative budget")
+        self.waiting.append((self.next_id, prompt, on_token))
         self.next_id += 1
         return self.next_id - 1
 
     def run_next(self) -> RequestOutput:
         self.state.thread_ids.append(threading.get_ident())
-        assert self.pending is not None
-        request_id, prompt = self.pending
-        self.pending = None
+        return self._complete(self.waiting.pop(0))
+
+    def run_batch(self, max_batch_size: int) -> list[RequestOutput]:
+        self.state.thread_ids.append(threading.get_ident())
+        selected = self.waiting[:max_batch_size]
+        del self.waiting[:max_batch_size]
+        self.state.batches.append([item[1] for item in selected])
+        return [self._complete(item) for item in selected]
+
+    def _complete(self, item: tuple[int, str, TokenCallback | None]) -> RequestOutput:
+        request_id, prompt, on_token = item
         self.state.calls.append(prompt)
         if prompt == "blocked":
             self.state.started.set()
@@ -58,8 +67,8 @@ class FakeEngine:
                 raise TimeoutError("Test did not release inference.")
         if prompt == "error":
             raise ValueError("request failed")
-        if self.on_token is not None:
-            self.on_token(TokenEvent(request_id, perf_counter()))
+        if on_token is not None:
+            on_token(TokenEvent(request_id, perf_counter()))
         return RequestOutput(request_id, prompt, f"answer:{prompt}", [request_id], None)
 
 
@@ -136,15 +145,17 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("worker.mx.synchronize", side_effect=synchronize),
             patch("worker.mx.reset_peak_memory") as reset,
+            patch("worker.mx.clear_cache") as clear,
             patch("worker.mx.get_peak_memory", return_value=200),
             patch("worker.mx.get_active_memory", return_value=100),
             patch("worker.mx.get_cache_memory", return_value=50),
         ):
             async with InferenceClient() as client:
-                await client.memory_snapshot(reset_peak=True)
+                await client.memory_snapshot(reset_peak=True, clear_cache=True)
                 await client.generate("one")
                 snapshot = await client.memory_snapshot()
             reset.assert_called_once()
+            clear.assert_called_once()
         self.assertEqual(snapshot.peak_bytes, 200)
         self.assertEqual(snapshot.allocator_cache_bytes, 50)
         self.assertEqual(probe_threads, [self.state.thread_ids[0]] * 2)
@@ -216,6 +227,93 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(client._worker._thread.is_alive())
         with self.assertRaises(RuntimeError):
             client.submit("after failure")
+
+    async def test_fixed_batches_do_not_admit_arrivals_during_generation(self) -> None:
+        async with InferenceClient(max_batch_size=2, batch_wait_ms=100) as client:
+            first = client.submit("blocked")
+            second = client.submit("second")
+            try:
+                await self.wait_for_event(self.state.started)
+                third = client.submit("third")
+                fourth = client.submit("fourth")
+                await asyncio.sleep(0)
+                self.assertEqual(self.state.batches, [["blocked", "second"]])
+                self.assertFalse(third.done())
+            finally:
+                self.state.release.set()
+            outputs = await asyncio.wait_for(asyncio.gather(first, second, third, fourth), 2)
+        self.assertEqual(self.state.batches, [["blocked", "second"], ["third", "fourth"]])
+        self.assertEqual([out.request_id for out in outputs], [0, 1, 2, 3])
+        self.assertEqual([out.timing.batch_size for out in outputs if out.timing], [2] * 4)
+        self.assertEqual([out.timing.batch_id for out in outputs if out.timing], [0, 0, 2, 2])
+        self.assertEqual(len(set(self.state.thread_ids)), 1)
+
+    async def test_partial_batch_and_invalid_request_make_progress(self) -> None:
+        async with InferenceClient(max_batch_size=4, batch_wait_ms=5) as client:
+            bad = client.submit("invalid", max_tokens=-1)
+            good = client.submit("good")
+            with self.assertRaisesRegex(ValueError, "negative budget"):
+                await bad
+            result = await asyncio.wait_for(good, 2)
+            self.assertEqual(result.prompt, "good")
+            assert result.timing is not None
+            self.assertEqual(result.timing.batch_size, 1)
+            self.assertEqual((await asyncio.wait_for(client.generate("alone"), 2)).prompt, "alone")
+
+    async def test_failed_batch_does_not_poison_next_batch(self) -> None:
+        async with InferenceClient(max_batch_size=2, batch_wait_ms=100) as client:
+            failed = client.submit("error")
+            affected = client.submit("same batch")
+            results = await asyncio.gather(failed, affected, return_exceptions=True)
+            self.assertTrue(all(isinstance(result, ValueError) for result in results))
+            self.assertEqual((await client.generate("later")).prompt, "later")
+
+    async def test_memory_probe_is_a_batch_barrier(self) -> None:
+        observed_calls: list[list[str]] = []
+        with (
+            patch("worker.mx.synchronize", side_effect=lambda: observed_calls.append(self.state.calls.copy())),
+            patch("worker.mx.get_peak_memory", return_value=200),
+            patch("worker.mx.get_active_memory", return_value=100),
+            patch("worker.mx.get_cache_memory", return_value=50),
+        ):
+            async with InferenceClient(max_batch_size=4, batch_wait_ms=100) as client:
+                first = client.submit("blocked")
+                probe = asyncio.create_task(client.memory_snapshot())
+                try:
+                    await asyncio.sleep(0)  # Put the probe in the FIFO before the next request.
+                    second = client.submit("after probe")
+                    await self.wait_for_event(self.state.started)
+                    self.assertFalse(probe.done())
+                finally:
+                    self.state.release.set()
+                await asyncio.wait_for(asyncio.gather(first, probe, second), 2)
+        self.assertEqual(observed_calls, [["blocked"]])
+        self.assertEqual(self.state.batches, [["blocked"], ["after probe"]])
+
+    async def test_batch_cancellation_and_shutdown_drain(self) -> None:
+        client: InferenceClient = InferenceClient(max_batch_size=2, batch_wait_ms=100)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+        first = client.submit("blocked")
+        second = client.submit("second")
+        try:
+            await self.wait_for_event(self.state.started)
+            cancelled = client.submit("cancelled")
+            cancelled.cancel()
+            first.cancel()
+            await asyncio.sleep(0)
+            last = client.submit("last")
+            closing = asyncio.create_task(client.close())
+            await asyncio.sleep(0)
+            self.assertFalse(closing.done())
+        finally:
+            self.state.release.set()
+        await asyncio.wait_for(closing, 2)
+        self.assertTrue(first.cancelled())
+        self.assertTrue(cancelled.cancelled())
+        self.assertEqual([out.prompt for out in await asyncio.gather(second, last)], ["second", "last"])
+        self.assertEqual(self.state.batches, [["blocked", "second"], ["last"]])
+        self.assertFalse(client._worker._thread.is_alive())
 
 
 if __name__ == "__main__":

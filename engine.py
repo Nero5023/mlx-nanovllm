@@ -1,4 +1,4 @@
-"""A synchronous FIFO inference engine: finish one request before starting another."""
+"""A synchronous FIFO engine with single-request and fixed-batch execution."""
 
 from collections import deque
 from pathlib import Path
@@ -9,6 +9,7 @@ from mlx_lm.utils import load_model
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from benchmark import BenchmarkStats
+from batch_infer import generate_batch_tokens
 from infer import DEFAULT_MODEL, encode_prompt, generate_tokens
 from request import Request, RequestOutput
 from sampler import GreedySampler, Sampler
@@ -18,8 +19,8 @@ from telemetry import TokenCallback
 class InferenceEngine:
     """Load one model and tokenizer, then reuse them for queued requests.
 
-    This first engine is single-threaded. run_next() blocks until one entire
-    request finishes; callers can enqueue more work between requests.
+    run_next() handles one request; run_batch() handles a fixed group. Both
+    block until completion; callers enqueue more work between executions.
     """
 
     def __init__(
@@ -121,3 +122,32 @@ class InferenceEngine:
         while (output := self.run_next()) is not None:
             outputs.append(output)
         return outputs
+
+    def run_batch(self, max_batch_size: int) -> list[RequestOutput]:
+        """Consume up to N oldest requests and finish them as one fixed batch.
+
+        Every request has its own budget, EOS rule, sampler and token callback.
+        Selected requests are removed even if inference fails; later work stays
+        queued. Per-request compute/memory statistics don't describe shared work,
+        so use the serving benchmark's case-level measurements for batches.
+        """
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive.")
+        if not self.use_cache or self.collect_stats:
+            raise ValueError("Fixed batches require use_cache=True and collect_stats=False.")
+        requests: list[Request] = [
+            self._waiting.popleft() for _ in range(min(max_batch_size, len(self._waiting)))
+        ]
+        if not requests:
+            return []
+        pad_token_id: int | None = cast(int | None, self.tokenizer.pad_token_id)
+        batches: list[list[int]] = generate_batch_tokens(
+            self.model, requests, self.eos_token_ids,
+            pad_token_id=pad_token_id if pad_token_id is not None else 0,
+            trace=self.trace,
+        )
+        return [RequestOutput(
+            request_id=request.request_id, prompt=request.prompt,
+            text=cast(str, self.tokenizer.decode(token_ids, skip_special_tokens=True)),
+            token_ids=token_ids, stats=None, prompt_tokens=len(request.prompt_token_ids),
+        ) for request, token_ids in zip(requests, batches, strict=True)]

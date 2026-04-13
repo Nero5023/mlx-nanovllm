@@ -104,6 +104,42 @@ class InferenceEngineTests(unittest.TestCase):
         self.assertEqual(self.engine.pending_requests, 1)
         self.assertEqual(self.engine.run()[0].request_id, second_id)
 
+    def test_fixed_batch_consumes_only_selected_requests_in_order(self) -> None:
+        self.engine.collect_stats = False
+        self.tokenizer_loader.return_value.pad_token_id = 0
+        for prompt, budget in [("first", 1), ("second", 2), ("third", 3)]:
+            self.engine.add_request(prompt, budget)
+        with patch("engine.generate_batch_tokens", return_value=[[4], [5, 6]]) as generate:
+            outputs = self.engine.run_batch(2)
+            self.assertEqual([out.prompt for out in outputs], ["first", "second"])
+            self.assertEqual([out.token_ids for out in outputs], [[4], [5, 6]])
+            self.assertEqual([request.max_tokens for request in generate.call_args.args[1]], [1, 2])
+        self.assertEqual(self.engine.pending_requests, 1)
+        self.assertEqual(self.engine.run()[0].prompt, "third")
+        self.assertEqual(self.engine.run_batch(2), [])
+
+    def test_fixed_batch_failure_preserves_later_requests(self) -> None:
+        self.engine.collect_stats = False
+        for prompt in ["a", "b", "c"]:
+            self.engine.add_request(prompt, 1)
+        with patch("engine.generate_batch_tokens", side_effect=RuntimeError("batch failed")):
+            with self.assertRaisesRegex(RuntimeError, "batch failed"):
+                self.engine.run_batch(2)
+        self.assertEqual(self.engine.pending_requests, 1)
+        self.assertEqual(self.engine.run()[0].prompt, "c")
+
+    def test_unsupported_batch_options_do_not_consume_queue(self) -> None:
+        self.engine.add_request("waiting", 1)
+        with self.assertRaises(ValueError):
+            self.engine.run_batch(0)
+        with self.assertRaisesRegex(ValueError, "collect_stats=False"):
+            self.engine.run_batch(2)
+        self.engine.collect_stats = False
+        self.engine.use_cache = False
+        with self.assertRaisesRegex(ValueError, "use_cache=True"):
+            self.engine.run_batch(2)
+        self.assertEqual(self.engine.pending_requests, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

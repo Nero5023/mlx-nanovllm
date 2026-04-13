@@ -1,0 +1,45 @@
+[
+  {
+    "dtype": "mlx.core.bfloat16",
+    "teacher_forced_steps": 16,
+    "max_abs_logit_difference": 0.71875,
+    "divergences": [
+      {
+        "step": 10,
+        "row": 0,
+        "serial_token": 369,
+        "batch_token": 315,
+        "serial_scores": [
+          22.25,
+          22.125
+        ],
+        "batch_scores": [
+          22.25,
+          22.25
+        ],
+        "max_abs_logit_difference": 0.609375
+      },
+      {
+        "step": 12,
+        "row": 1,
+        "serial_token": 487,
+        "batch_token": 25,
+        "serial_scores": [
+          15.4375,
+          15.375
+        ],
+        "batch_scores": [
+          15.5,
+          15.5
+        ],
+        "max_abs_logit_difference": 0.5
+      }
+    ]
+  },
+  {
+    "dtype": "mlx.core.float32",
+    "teacher_forced_steps": 16,
+    "max_abs_logit_difference": 0.00011372566223144531,
+    "divergences": []
+  }
+]
