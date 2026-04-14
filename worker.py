@@ -147,32 +147,28 @@ class InferenceWorker:
             return
         self._ready.set_result(None)
 
-        # A control message encountered while collecting a batch is a FIFO barrier.
         deferred: deque[_MemoryProbe | None] = deque()
+        while (items := self._next_batch(deferred)) is not None:
+            self._run_requests(engine, items)
+
+    def _next_batch(
+        self, deferred: deque[_MemoryProbe | None],
+    ) -> list[_WorkItem] | None:
+        """Collect the next batch, handling control messages in FIFO order.
+
+        A control message found during collection is deferred until the caller
+        finishes this batch. Return None when the shutdown marker is reached.
+        """
         while True:
             item: _WorkItem | _MemoryProbe | None = (
                 deferred.popleft() if deferred else self._queue.get()
             )
             if item is None:
-                return
+                return None
             if item.future.cancelled():
                 continue
             if isinstance(item, _MemoryProbe):
-                if not item.future.set_running_or_notify_cancel():
-                    continue
-                try:
-                    mx.synchronize()
-                    if item.clear_cache:
-                        mx.clear_cache()  # Release unused allocator buffers, not live KV/weights.
-                    if item.reset_peak:
-                        mx.reset_peak_memory()
-                    item.future.set_result(MemorySnapshot(
-                        peak_bytes=max(mx.get_peak_memory(), mx.get_active_memory()),
-                        active_bytes=mx.get_active_memory(),
-                        allocator_cache_bytes=mx.get_cache_memory(),
-                    ))
-                except BaseException as error:
-                    item.future.set_exception(error)
+                self._handle_memory_probe(item)
                 continue
 
             items: list[_WorkItem] = [item]
@@ -189,7 +185,25 @@ class InferenceWorker:
                     break
                 if not following.future.cancelled():
                     items.append(following)
-            self._run_requests(engine, items)
+            return items
+
+    def _handle_memory_probe(self, probe: _MemoryProbe) -> None:
+        """Measure memory on the worker thread and deliver the result or error."""
+        if not probe.future.set_running_or_notify_cancel():
+            return
+        try:
+            mx.synchronize()
+            if probe.clear_cache:
+                mx.clear_cache()  # Release unused allocator buffers, not live KV/weights.
+            if probe.reset_peak:
+                mx.reset_peak_memory()
+            probe.future.set_result(MemorySnapshot(
+                peak_bytes=max(mx.get_peak_memory(), mx.get_active_memory()),
+                active_bytes=mx.get_active_memory(),
+                allocator_cache_bytes=mx.get_cache_memory(),
+            ))
+        except BaseException as error:
+            probe.future.set_exception(error)
 
     def _run_requests(self, engine: InferenceEngine, items: list[_WorkItem]) -> None:
         running: list[_WorkItem] = []
