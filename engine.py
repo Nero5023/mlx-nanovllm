@@ -1,4 +1,4 @@
-"""A synchronous FIFO engine with single-request and fixed-batch execution."""
+"""A synchronous FIFO engine with single-request and compacting-batch execution."""
 
 from collections import deque
 from pathlib import Path
@@ -124,7 +124,7 @@ class InferenceEngine:
         return outputs
 
     def run_batch(self, max_batch_size: int) -> list[RequestOutput]:
-        """Consume up to N oldest requests and finish them as one fixed batch.
+        """Consume up to N oldest requests; remove completed rows during decode.
 
         Every request has its own budget, EOS rule, sampler and token callback.
         Selected requests are removed even if inference fails; later work stays

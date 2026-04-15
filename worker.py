@@ -1,4 +1,4 @@
-"""One model-owning thread serving FIFO requests individually or in fixed batches."""
+"""One model-owning thread serving FIFO requests individually or in batches."""
 
 from concurrent.futures import Future
 from collections import deque
@@ -210,7 +210,7 @@ class InferenceWorker:
         started_at: float = perf_counter()
         for item in items:
             # Cancel before admission: skip. Once admitted, cancellation only
-            # discards its result; the row stays in this fixed batch.
+            # discards its result; generation follows the original EOS/budget rules.
             if not item.future.set_running_or_notify_cancel():
                 continue
             try:

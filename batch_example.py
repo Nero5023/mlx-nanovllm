@@ -1,4 +1,4 @@
-"""Submit four requests together; inspect one fixed batch's tensor shapes."""
+"""Submit four requests together; trace the shrinking batch and surviving request IDs."""
 
 import asyncio
 
@@ -21,7 +21,7 @@ async def main() -> None:
             print(f"\nRequest {output.request_id}: {output.prompt}")
             print(output.text)
             if output.timing is not None:
-                print(f"batch={output.timing.batch_id}, batch_size={output.timing.batch_size}")
+                print(f"batch={output.timing.batch_id}, admitted_batch_size={output.timing.batch_size}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""A fixed batch: one prefill, then one token per unfinished row per step."""
+"""One admitted group: prefill together, then remove finished rows during decode."""
 
 import sys
 from time import perf_counter
@@ -23,29 +23,33 @@ def generate_batch_tokens(
 ) -> list[list[int]]:
     """Return each row's output IDs in request order, excluding stopping EOS.
 
-    Batch membership and the batch dimension stay fixed until every row finishes.
-    Finished rows feed dummy tokens and retain their KV allocation. No new
-    requests enter this loop; removing/refilling rows is a later milestone.
+    Only unfinished requests participate in each forward pass. active_indices
+    maps current batch rows to positions in requests/generated. No new requests
+    enter this loop; admitting more work during decode is a later milestone.
     """
     for request in requests:
         if not request.prompt_token_ids or request.max_tokens < 0:
             raise ValueError("Each request needs a nonempty prompt and nonnegative budget.")
     generated: list[list[int]] = [[] for _ in requests]
-    finished: list[bool] = [request.max_tokens == 0 for request in requests]
-    if all(finished):
+    active_indices: list[int] = [
+        index for index, request in enumerate(requests) if request.max_tokens > 0
+    ]
+    if not active_indices:
         return generated
 
-    width: int = max(len(request.prompt_token_ids) for request in requests)
-    left_padding: list[int] = [width - len(request.prompt_token_ids) for request in requests]
+    width: int = max(len(requests[index].prompt_token_ids) for index in active_indices)
+    left_padding: list[int] = [
+        width - len(requests[index].prompt_token_ids) for index in active_indices
+    ]
     inputs: mx.array = mx.array([
-        [pad_token_id] * padding + request.prompt_token_ids
-        for padding, request in zip(left_padding, requests)
+        [pad_token_id] * padding + requests[index].prompt_token_ids
+        for padding, index in zip(left_padding, active_indices)
     ], dtype=mx.int32)  # [batch, padded prompt length]
 
     # Each layer has batched K/V tensors. The cache supplies a padding-aware
     # attention mask and a separate RoPE offset for each row, starting at -pad.
     cache: list[BatchKVCache] = [BatchKVCache(left_padding) for _ in model.layers]
-    all_greedy: bool = all(type(request.sampler) is GreedySampler for request in requests)
+    all_greedy: bool = all(type(requests[index].sampler) is GreedySampler for index in active_indices)
     greedy: GreedySampler = GreedySampler()
 
     for step in range(max(request.max_tokens for request in requests)):
@@ -54,39 +58,42 @@ def generate_batch_tokens(
         if all_greedy:
             next_tokens: mx.array = greedy.sample(last_logits)
         else:
-            # Preserve each request's sampler/state; stopped rows no longer sample.
+            # Use the original request's sampler even after its row number changes.
             next_tokens = mx.concatenate([
-                mx.array([pad_token_id], dtype=mx.int32) if finished[row]
-                else request.sampler.sample(last_logits[row:row + 1])
-                for row, request in enumerate(requests)
+                requests[index].sampler.sample(last_logits[row:row + 1])
+                for row, index in enumerate(active_indices)
             ])
         token_ids: list[int] = cast(list[int], next_tokens.tolist())  # One GPU evaluation.
         generated_at: float = perf_counter()
 
         if trace:
             print(
-                f"{'prefill' if step == 0 else 'decode':7} batch={len(requests)} "
+                f"{'prefill' if step == 0 else 'decode':7} batch={len(active_indices)} "
                 f"input={inputs.shape} logits={logits.shape} "
-                f"offsets={cache[0].offset.tolist()} finished={finished}",
+                f"offsets={cache[0].offset.tolist()} "
+                f"request_ids={[requests[index].request_id for index in active_indices]}",
                 file=sys.stderr,
             )
 
-        for row, (request, token_id) in enumerate(zip(requests, token_ids)):
-            if finished[row]:
-                continue
+        keep_rows: list[int] = []  # Positions in this step's tensors, not original request IDs.
+        for row, (index, token_id) in enumerate(zip(active_indices, token_ids, strict=True)):
+            request: Request = requests[index]
             if token_id in eos_token_ids and not request.ignore_eos:
-                finished[row] = True
                 continue
-            generated[row].append(token_id)
+            generated[index].append(token_id)
             if request.on_token is not None:
                 request.on_token(TokenEvent(token_id, generated_at))
-            finished[row] = len(generated[row]) >= request.max_tokens
+            if len(generated[index]) < request.max_tokens:
+                keep_rows.append(row)
 
-        if all(finished):
+        if not keep_rows:
             break
-        inputs = mx.array([
-            [pad_token_id if finished[row] else token_id]
-            for row, token_id in enumerate(token_ids)
-        ], dtype=mx.int32)  # [batch, 1]; finished rows cannot affect other rows.
+        if len(keep_rows) < len(active_indices):
+            for layer_cache in cache:
+                # Filters K, V, offsets and padding together. It also drops any
+                # left padding shared by every surviving row.
+                layer_cache.filter(keep_rows)
+            active_indices = [active_indices[row] for row in keep_rows]
+        inputs = mx.array([[token_ids[row]] for row in keep_rows], dtype=mx.int32)
 
     return generated

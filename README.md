@@ -8,13 +8,15 @@ inference baseline, environment, and benchmark result. Code and report are tagge
 `v0.1` together.
 
 The `v0.2` tag records the async FIFO worker and serving benchmark baseline.
-The engine now also supports fixed batches: several requests share each model
-forward pass, and later arrivals wait until the current batch finishes.
+The `v0.3` tag records fixed batching and its benchmark comparison. The next
+step is batch compaction: completed rows now leave the active tensors and KV
+cache. Later arrivals still wait until the admitted group finishes.
 
-## Fixed batches
+## Batched inference and compaction
 
-The [fixed-batching benchmark archive](reports/fixed-batching/README.md) records
-the serial comparison, raw observations, and BF16 numerical differences.
+The [v0.3 fixed-batching archive](reports/fixed-batching/README.md) records
+the earlier serial comparison, raw observations, and BF16 numerical differences.
+Those measurements predate compaction.
 
 ```bash
 uv run python batch_example.py
@@ -46,35 +48,48 @@ Start reading [batch_infer.py](batch_infer.py). `generate_batch_tokens()`:
 3. Runs one forward pass per step. Greedy sampling selects one token per row;
    `.tolist()` evaluates the batch once. Decode input is `[batch, 1]`.
 4. Tracks each row's EOS, output budget, sampler and token callback independently.
-   Completed rows retain their KV and feed dummy tokens, without emitting more
-   output. Batch membership stays fixed until all rows finish.
+   Completed rows leave the next forward pass. Zero-budget requests are excluded
+   before prefill and still return an empty output at their original position.
+5. Keeps `active_indices` to map each current tensor row to the original request
+   position. After a step, `keep_rows` selects the surviving *current* rows for
+   the next input and every layer's `BatchKVCache.filter()`. The filter also
+   adjusts padding and RoPE metadata, including removal of shared left padding.
+
+For example, requests A/B/C can shrink from 3 rows to 2 to 1 as they reach EOS
+or their budgets. Results and callbacks still belong to the original requests.
+Trace output from `batch_example.py` shows the shrinking `batch` dimension and current
+`request_ids`. KV filtering can copy buffers; removing rows reduces subsequent
+work but does not guarantee a lower peak allocation or instant OS memory release.
 
 `engine.run_batch(N)` removes up to N already queued requests and calls this
 loop. `worker.py` forms groups from async submissions; it never adds a new row
 while a batch is generating. Token callbacks arrive during generation, but final
 request futures all complete at the end of their batch. This deliberately makes
-the long/short-request cost visible before we implement continuous batching.
+compaction one separate learning step: new-request admission and early delivery
+of completed request futures are still future work.
 
-`RequestOutput.timing` records actual `batch_size` and a `batch_id` (the first
-request ID in that group). These show whether simultaneous clients actually
-formed a model batch. Invalid requests fail individually before model execution;
+`RequestOutput.timing` records the admitted group's `batch_size` and a `batch_id`
+(the first request ID in that group). The active row count can now shrink and
+can start smaller when some budgets are zero; use trace output to inspect it.
+Invalid requests fail individually before model execution;
 a shared inference failure fails the selected batch, and later batches continue.
-Cancellation skips a request before admission; after admission its row remains
-until batch completion. Memory probes and shutdown are FIFO barriers.
+Cancellation skips a request before admission; after admission its generation
+continues to its original EOS/budget condition. Memory probes and shutdown are FIFO barriers.
 
 This stage requires KV caching and `collect_stats=False` when batching is
 enabled. Per-request compute/memory stats cannot attribute shared batch work;
 use `bench.py` for client latency and case-level memory. Padded rows consume
 memory and compute, so similar prompt/output lengths are the simplest first
-comparison. No active-row removal, slot refill, or prefix sharing is implemented.
+comparison. No slot refill or prefix sharing is implemented yet.
 
 ```bash
 uv run python -m unittest -v test_engine test_client test_bench test_batch_infer
 ```
 
-The tests cover fixed membership, partial batches, failure/cancellation/shutdown,
-individual EOS/budgets, padding, and real tiny-Qwen prefill/decode logits compared
-with unpadded serial inference. The benchmark also compares real model output
+The tests cover partial batches, failure/cancellation/shutdown, independent
+EOS/budgets, repeated row compaction, output/callback mapping, and zero-budget
+requests. Tiny-Qwen logits after cache filtering are compared with unpadded serial
+inference. The benchmark also compares real model output
 token IDs for mixed lengths/budgets, reordered batches, and a partial batch.
 
 Batch and serial execution can use different numerical kernels. With 4-bit

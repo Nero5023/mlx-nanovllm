@@ -197,7 +197,9 @@ def metadata(
             for path in sorted(model_path.iterdir())
             if path.suffix in {".json", ".safetensors"}
         },
-        "backend": "fixed-batch-worker" if max_batch_size > 1 else "fifo-worker",
+        "backend": "compacting-batch-worker" if max_batch_size > 1 else "fifo-worker",
+        "batch_compaction": max_batch_size > 1,
+        "batch_size_scope": "Admitted group size, not the number of active rows at each decode step.",
         "max_active_requests": max_batch_size,
         "batch_wait_ms": batch_wait_ms if max_batch_size > 1 else 0.0,
         "use_kv_cache": use_cache, "prefix_reuse": False, "paged_kv": False,
@@ -237,7 +239,7 @@ def write_report(
         "TTFT includes queueing and client notification. ITL pools consecutive token gaps; "
         "TPOT averages gaps per request. Values are milliseconds. Throughput is the median "
         "of per-repeat output tokens / total workload wall time; memory is the maximum across repeats.", "",
-        "| Case | Runs | OK / all | Actual batch sizes | TTFT p50 / p95 | ITL p50 / p95 | TPOT p50 | Queue p50 | Output tok/s p50 | Peak GB |",
+        "| Case | Runs | OK / all | Admitted batch sizes | TTFT p50 / p95 | ITL p50 / p95 | TPOT p50 | Queue p50 | Output tok/s p50 | Peak GB |",
         "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for case in cases:
@@ -281,7 +283,7 @@ def write_report(
         "These are short synthetic workloads, not steady-state production load. Small-sample "
         "tail percentiles are descriptive. No GPU utilization or hardware capacity limit is measured. "
         "Queued requests have no active KV cache; active batch rows do. Concurrency is client "
-        "in-flight work; the actual batch-size column records model execution groups.", "",
+        "in-flight work; admitted group sizes do not track shrinking decode tensors.", "",
         "The largest successful context/concurrency is only the largest tested configuration. "
         "Prefix scenarios measure the current baseline; this backend has no cross-request prefix cache.", "",
         "See BENCHMARKS.md for formulas, workload purposes and backend comparison rules.",
@@ -345,7 +347,7 @@ def main() -> None:
     parser.add_argument("--case", action="append", help="Select a case; can be repeated.")
     parser.add_argument("--max-prompt-tokens", type=int, default=2048)
     parser.add_argument("--max-concurrency", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=1, help="Max fixed batch size; 1 keeps serial execution.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Max admitted group size; finished rows compact during decode. 1 keeps serial execution.")
     parser.add_argument("--batch-wait-ms", type=float, default=2.0, help="Max collection wait before starting a partial batch.")
     parser.add_argument("--no-cache", action="store_true", help="Full-prefix recomputation ablation.")
     parser.add_argument("--output", type=Path, default=Path("benchmarks") / f"suite-{uuid4().hex[:12]}")

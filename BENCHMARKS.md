@@ -1,15 +1,16 @@
 # Serving benchmark
 
 This suite measures the async client → worker path on the local Qwen model.
-The default is **one active request**; `--batch-size N` enables fixed batches.
-There is no continuous batching, cross-request prefix reuse, or paged KV cache.
+The default is **one active request**; `--batch-size N` admits groups of up to N.
+Finished rows now compact during decode. No new rows join an active group yet,
+and there is no cross-request prefix reuse or paged KV cache.
 Workloads stay separate from scheduling so the same requests compare each stage.
 
 ```bash
 # All main scenarios, three repeats each.
 uv run python bench.py --output benchmarks/fifo-baseline
 
-# Same workloads, fixed groups of at most four. Default collection wait: 2 ms.
+# Same workloads, groups of at most four with compaction. Collection wait: 2 ms.
 uv run python bench.py --batch-size 4 --output benchmarks/fixed-batch-4
 
 # Add adjacent-length cases for allocation/kernel changes.
@@ -64,12 +65,15 @@ Per-repeat values remain available to see variation. Three repeats and short
 bursts are useful for development; their tail percentiles are descriptive,
 not a production SLO or a steady-state capacity measurement.
 
-The report records both client concurrency and **actual execution batch sizes**.
+The report records both client concurrency and **admitted group sizes**.
 Four in-flight requests can form smaller batches if their arrivals are staggered.
 `--batch-wait-ms` bounds the collection wait (default 2 ms) and contributes to
-queue time. Fixed batches never refill during generation. Finished rows stop
-emitting tokens, but their final response waits for the whole batch; E2E latency
-therefore includes this wait. Per-request timing includes the execution batch ID.
+queue time. Groups never refill during generation. Finished rows leave the active
+tensors and KV cache, but their final response waits for the whole group; E2E
+latency therefore includes this wait. `timing.batch_size` (and the legacy JSON
+name `actual_batch_sizes`) describes the admitted group, not each decode step's
+live row count. Trace output shows current rows. Metadata records compaction so
+new results are distinguishable from the archived fixed-batch v0.3 measurements.
 
 MLX's [peak-memory counter](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.get_peak_memory.html)
 excludes unused buffers retained in the allocator cache. We record allocator
@@ -132,7 +136,8 @@ as the intended offered load.
 
 The concurrency sweep is client in-flight requests, **not active GPU batch size**.
 Queued requests have no KV caches. Active batch rows each occupy KV storage,
-including left padding and finished rows retained until batch completion. The
+including left padding. Compaction filters finished rows before the next forward
+pass; the allocator may retain freed buffers and filtering itself can allocate. The
 serial path's queue memory cannot demonstrate this simultaneous active-context cost.
 The largest successful tested configuration is only a tested bound, not the
 machine's limit. Increase `--max-concurrency` and `--max-prompt-tokens` deliberately;
@@ -156,7 +161,7 @@ For each later milestone, preserve the model/tokenizer hashes, sampler, prompt
 IDs, output budgets, arrivals, warmup policy, and environment. Compare each
 request's stored output IDs with this baseline before interpreting speedups;
 the current cache/full-recompute check alone cannot validate a new batch engine.
-Actual execution batch sizes are now recorded. Add genuine prefix hits/recomputed
+Admitted group sizes are recorded. Add genuine prefix hits/recomputed
 tokens and page occupancy once those implementations exist. Raw source hashes
 record the code even before a commit.
 
