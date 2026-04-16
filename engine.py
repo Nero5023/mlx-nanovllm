@@ -1,4 +1,4 @@
-"""A synchronous FIFO engine with single-request and compacting-batch execution."""
+"""Model ownership and request state; the worker decides when to admit or decode."""
 
 from collections import deque
 from pathlib import Path
@@ -9,7 +9,7 @@ from mlx_lm.utils import load_model
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from benchmark import BenchmarkStats
-from batch_infer import generate_batch_tokens
+from batch_infer import ActiveRequest, BatchState, generate_batch_tokens
 from infer import DEFAULT_MODEL, encode_prompt, generate_tokens
 from request import Request, RequestOutput
 from sampler import GreedySampler, Sampler
@@ -19,8 +19,8 @@ from telemetry import TokenCallback
 class InferenceEngine:
     """Load one model and tokenizer, then reuse them for queued requests.
 
-    run_next() handles one request; run_batch() handles a fixed group. Both
-    block until completion; callers enqueue more work between executions.
+    run_next()/run_batch() complete a request/group. Continuous serving uses
+    prefill_next() to admit work and step() to advance the active batch once.
     """
 
     def __init__(
@@ -48,10 +48,15 @@ class InferenceEngine:
         self.collect_stats: bool = collect_stats
         self._waiting: deque[Request] = deque()
         self._next_request_id: int = 0
+        self._batch: BatchState | None = None
 
     @property
     def pending_requests(self) -> int:
         return len(self._waiting)
+
+    @property
+    def active_requests(self) -> int:
+        return self._batch.size if self._batch is not None else 0
 
     def add_request(
         self,
@@ -151,3 +156,58 @@ class InferenceEngine:
             text=cast(str, self.tokenizer.decode(token_ids, skip_special_tokens=True)),
             token_ids=token_ids, stats=None, prompt_tokens=len(request.prompt_token_ids),
         ) for request, token_ids in zip(requests, batches, strict=True)]
+
+    def prefill_next(self, max_requests: int) -> list[RequestOutput]:
+        """Prefill queued requests separately, then merge survivors into decode.
+
+        The worker limits admission to available slots. A complete prefill blocks
+        existing decode work; chunking that prefill is a later optimization.
+        Zero-budget and one-token/EOS requests can finish at admission.
+        """
+        if max_requests < 1:
+            raise ValueError("max_requests must be positive.")
+        if not self.use_cache or self.collect_stats:
+            raise ValueError("Batching requires use_cache=True and collect_stats=False.")
+        count = min(max_requests, len(self._waiting))
+        states: list[ActiveRequest] = []
+        for _ in range(count):
+            request = self._waiting.popleft()
+            states.append(ActiveRequest(request))
+
+        finished: list[ActiveRequest] = [state for state in states if state.request.max_tokens == 0]
+        active: list[ActiveRequest] = [state for state in states if state.request.max_tokens > 0]
+
+        if active:
+            pad_token_id: int | None = cast(int | None, self.tokenizer.pad_token_id)
+            incoming: BatchState = BatchState(
+                self.model, active, self.eos_token_ids,
+                pad_token_id=pad_token_id if pad_token_id is not None else 0, trace=self.trace,
+            )
+            finished.extend(incoming.step())
+            if incoming.size:
+                if self._batch is None:
+                    self._batch = incoming
+                else:
+                    self._batch.extend(incoming)
+        return [self._output(state) for state in finished]
+
+    def step(self) -> list[RequestOutput]:
+        """Decode one token per active row; return only newly finished requests."""
+        if self._batch is None:
+            return []
+        finished: list[ActiveRequest] = self._batch.step()
+        if not self._batch.size:
+            self._batch = None
+        return [self._output(state) for state in finished]
+
+    def abort_batch(self) -> None:
+        """Discard active state after a shared inference failure."""
+        self._batch = None
+
+    def _output(self, state: ActiveRequest) -> RequestOutput:
+        return RequestOutput(
+            request_id=state.request.request_id, prompt=state.request.prompt,
+            text=cast(str, self.tokenizer.decode(state.token_ids, skip_special_tokens=True)),
+            token_ids=state.token_ids, stats=None,
+            prompt_tokens=len(state.request.prompt_token_ids),
+        )

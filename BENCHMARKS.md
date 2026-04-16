@@ -1,17 +1,18 @@
 # Serving benchmark
 
 This suite measures the async client → worker path on the local Qwen model.
-The default is **one active request**; `--batch-size N` admits groups of up to N.
-Finished rows now compact during decode. No new rows join an active group yet,
-and there is no cross-request prefix reuse or paged KV cache.
+The default is **one active request**; `--batch-size N` enables up to N active rows.
+Finished rows compact during decode, and queued requests refill available slots.
+New requests prefill separately before their KV joins active decode. There is no
+chunked prefill, cross-request prefix reuse, or paged KV cache.
 Workloads stay separate from scheduling so the same requests compare each stage.
 
 ```bash
 # All main scenarios, three repeats each.
 uv run python bench.py --output benchmarks/fifo-baseline
 
-# Same workloads, groups of at most four with compaction. Collection wait: 2 ms.
-uv run python bench.py --batch-size 4 --output benchmarks/fixed-batch-4
+# Same workloads, up to four active rows. Idle collection wait: 2 ms.
+uv run python bench.py --batch-size 4 --output benchmarks/continuous-batch-4
 
 # Add adjacent-length cases for allocation/kernel changes.
 uv run python bench.py --profile full --repeats 3 \
@@ -35,7 +36,7 @@ exit unsuccessfully, and errors remain in the JSON.
 ## What the measurements mean
 
 Every timestamp uses `time.perf_counter()` in the same process. The worker emits
-a token event after `.item()` has evaluated the MLX graph. The async client
+a token event after `.item()` / batched `.tolist()` evaluates the MLX graph. The async client
 delivers that event on its event loop. This measures local token notification,
 including event-loop delays; there is no HTTP transport or incremental text
 detokenization. The final response still contains the complete decoded text.
@@ -65,15 +66,17 @@ Per-repeat values remain available to see variation. Three repeats and short
 bursts are useful for development; their tail percentiles are descriptive,
 not a production SLO or a steady-state capacity measurement.
 
-The report records both client concurrency and **admitted group sizes**.
-Four in-flight requests can form smaller batches if their arrivals are staggered.
-`--batch-wait-ms` bounds the collection wait (default 2 ms) and contributes to
-queue time. Groups never refill during generation. Finished rows leave the active
-tensors and KV cache, but their final response waits for the whole group; E2E
-latency therefore includes this wait. `timing.batch_size` (and the legacy JSON
-name `actual_batch_sizes`) describes the admitted group, not each decode step's
-live row count. Trace output shows current rows. Metadata records compaction so
-new results are distinguishable from the archived fixed-batch v0.3 measurements.
+The report records both client concurrency and **admission group sizes**.
+`--batch-wait-ms` bounds collection only when idle (default 2 ms) and contributes
+to queue time. Active decode never waits to fill slots. Incoming groups prefill
+separately, temporarily pausing existing decode; this can produce ITL spikes.
+Completed requests return individually, and later arrivals fill free slots.
+`timing.batch_size` (and the legacy JSON name `actual_batch_sizes`) counts newly
+admitted requests together, including any zero-budget requests. It is not each
+decode step's live row count: decode can merge survivors from several groups.
+`completed_batches` counts these admission groups, not model forward passes.
+Trace shows active row IDs. Metadata records continuous batching and compaction
+to distinguish it from v0.3 fixed groups and v0.3.5 compaction without refill.
 
 MLX's [peak-memory counter](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.get_peak_memory.html)
 excludes unused buffers retained in the allocator cache. We record allocator
@@ -96,9 +99,11 @@ compare equivalent commands/workloads when assessing regressions.
 | Paging / context memory | `context-*`, `context-burst` | Context-length sweep and simultaneous long-context requests. Compare active memory and latency at identical input/output work. |
 | Allocation / kernel optimization | `boundary-127/128/129`, `255/256/257`, `511/512/513` in `full` | Nearby lengths and decode growth across boundaries. These are probes, not a claim about a future engine's page size; add the actual page/kernel boundaries when known. |
 
-With fixed batching enabled, preflight checks additionally compare a mixed group
+With batching enabled, preflight checks additionally compare a mixed group
 against serial greedy inference, reverse request order to test row mapping and
-cache isolation, and verify an underfilled batch. Different kernel shapes can
+cache isolation, and verify an underfilled batch. A late-arriving short request
+must match serial output and finish before an already-generating long request;
+the long request's output must also match serial. Different kernel shapes can
 produce floating-point differences; a token mismatch is reported as a failed
 check for investigation, never silently accepted as correct.
 

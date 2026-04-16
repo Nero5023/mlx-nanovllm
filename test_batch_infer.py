@@ -7,7 +7,7 @@ import mlx.core as mx
 from mlx_lm.models.cache import BatchKVCache, KVCache
 from mlx_lm.models.qwen3 import Model, ModelArgs
 
-from batch_infer import generate_batch_tokens
+from batch_infer import ActiveRequest, BatchState, generate_batch_tokens
 from infer import generate_tokens
 from request import Request
 from sampler import GreedySampler, Sampler
@@ -128,6 +128,36 @@ class BatchCompactionTests(unittest.TestCase):
         self.assertEqual(generate_batch_tokens(cast(Model, model), requests, {9}), [[], [5]])
         self.assertEqual(len(model.inputs), 1)  # Never call filter([]) or run an empty batch.
 
+    def test_merge_after_compaction_preserves_inputs_outputs_and_every_layer(self) -> None:
+        model: ScriptedModel = ScriptedModel([[4, 5], [6], [7, 8], [5], [6]])
+        states: list[ActiveRequest] = [
+            ActiveRequest(Request(101, "long", [1, 2], 4, GreedySampler())),
+            ActiveRequest(Request(303, "short", [3], 1, GreedySampler())),
+            ActiveRequest(Request(505, "incoming", [6, 7, 8, 9, 1], 2, GreedySampler())),
+        ]
+        batch: BatchState = BatchState(cast(Model, model), states[:2], set())
+        self.assertEqual(batch.step(), [states[1]])
+        incoming: BatchState = BatchState(cast(Model, model), states[2:], set())
+        self.assertEqual(incoming.step(), [])
+        batch.extend(incoming)
+        self.assertEqual(batch.step(), [states[2]])
+        for layer in model.cache_history[2]:
+            self.assertEqual(layer, {
+                "keys": [[0, 0, 0, 1, 2], [6, 7, 8, 9, 1]],
+                "values": [[0, 0, 0, 101, 102], [106, 107, 108, 109, 101]],
+                "offsets": [2, 5], "padding": [3, 0],
+            })
+        self.assertEqual(model.inputs[2], [[4], [6]])
+        self.assertEqual(batch.step(), [])
+        for layer in model.cache_history[3]:
+            self.assertEqual(layer["keys"], [[1, 2, 4]])
+            self.assertEqual(layer["offsets"], [3])
+            self.assertEqual(layer["padding"], [0])
+        self.assertEqual(batch.step(), [states[0]])
+        self.assertEqual([state.token_ids for state in states], [[4, 7, 5, 6], [5], [6, 8]])
+        self.assertEqual(batch.size, 0)
+        self.assertEqual(batch.cache, [])
+
     def test_tiny_qwen_prefill_decode_and_compaction_match_unpadded_logits(self) -> None:
         mx.random.seed(7)
         model: Model = Model(ModelArgs(
@@ -169,6 +199,28 @@ class BatchCompactionTests(unittest.TestCase):
             assert keys is not None and values is not None
             self.assertEqual(keys.shape[0], len(keep))
             self.assertEqual(values.shape[0], len(keep))
+
+        # Merge prompts both longer and shorter than the surviving cache. Compare
+        # on identical token histories so sampling differences cannot hide errors.
+        for incoming_prompts in [[list(range(1, 13)), [20]], [[21, 22]]]:
+            width: int = max(map(len, incoming_prompts))
+            incoming_padding: list[int] = [width - len(prompt) for prompt in incoming_prompts]
+            incoming_cache: list[BatchKVCache] = [BatchKVCache(incoming_padding) for _ in model.layers]
+            incoming_inputs: mx.array = mx.array([
+                [0] * pad + prompt for pad, prompt in zip(incoming_padding, incoming_prompts, strict=True)
+            ])
+            mx.eval(model(incoming_inputs, cache=incoming_cache))
+            for prompt in incoming_prompts:
+                serial_cache: list[KVCache] = [KVCache() for _ in model.layers]
+                mx.eval(model(mx.array([prompt]), cache=serial_cache))
+                serial_caches.append(serial_cache)
+            for layer, incoming_layer in zip(batch_cache, incoming_cache, strict=True):
+                layer.extend(incoming_layer)
+            tokens = mx.array([[23 + row] for row in range(len(serial_caches))])
+            batch_logits = model(tokens, cache=batch_cache)[:, -1, :]
+            for row, cache in enumerate(serial_caches):
+                serial_logits = model(tokens[row:row + 1], cache=cache)[:, -1, :]
+                self.assertTrue(mx.allclose(batch_logits[row:row + 1], serial_logits, atol=1e-5, rtol=1e-5).item())
         requests: list[Request] = [
             Request(row, str(row), prompt, row + 1, GreedySampler())
             for row, prompt in enumerate(prompts)

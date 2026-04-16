@@ -8,11 +8,11 @@ inference baseline, environment, and benchmark result. Code and report are tagge
 `v0.1` together.
 
 The `v0.2` tag records the async FIFO worker and serving benchmark baseline.
-The `v0.3` tag records fixed batching and its benchmark comparison. The next
-step is batch compaction: completed rows now leave the active tensors and KV
-cache. Later arrivals still wait until the admitted group finishes.
+The `v0.3` tag records fixed batching and its benchmark comparison. `v0.3.5`
+adds batch compaction. The current step adds continuous admission: completed
+requests return immediately, and queued requests fill available decode slots.
 
-## Batched inference and compaction
+## Continuous batching
 
 The [v0.3 fixed-batching archive](reports/fixed-batching/README.md) records
 the earlier serial comparison, raw observations, and BF16 numerical differences.
@@ -20,6 +20,7 @@ Those measurements predate compaction.
 
 ```bash
 uv run python batch_example.py
+uv run python continuous_example.py
 uv run python bench.py --batch-size 4 --repeats 3
 ```
 
@@ -32,13 +33,31 @@ async with InferenceClient(max_batch_size=4, batch_wait_ms=2.0) as client:
 ```
 
 The existing `submit()` / `generate()` API is unchanged. Set `max_batch_size`
-to enable batching; its default of 1 retains the serial path. Before starting
-a batch, the worker collects up to that many FIFO requests, waiting at most
+to enable continuous batching; its default of 1 retains the serial path. When
+idle, the worker collects up to that many FIFO requests, waiting at most
 `batch_wait_ms` for more arrivals. A partial batch runs when the wait expires;
 there is no requirement to fill every slot. Set the wait to 0 to collect only
 already queued work. Collection wait is included in queue time and TTFT.
+While requests are active, it checks the queue without waiting at each decode
+boundary. A full batch keeps decoding until a slot becomes available.
 
-Start reading [batch_infer.py](batch_infer.py). `generate_batch_tokens()`:
+Start reading [worker.py](worker.py), `_run_continuous()`. Each iteration:
+
+1. Takes FIFO requests for the available slots (no collection wait when active).
+2. Calls `engine.prefill_next()` to prefill incoming prompts separately and
+   generate their first tokens. Each layer's `cache.extend()` aligns KV histories
+   using left padding, then appends surviving new rows.
+3. Delivers requests that completed during admission, including zero budgets.
+4. Calls `engine.step()` to decode one token per active row, remove completed
+   rows, and deliver their results immediately. Then checks for new work again.
+
+`engine.add_request()` handles tokenization and validation before prefill.
+Prefill is a whole forward pass on the same worker, so it pauses existing decode.
+This first implementation has no chunked prefill, prefix reuse, or paged KV.
+Every iteration advances existing requests even if incoming short requests keep
+arriving; the scheduler does not continually prefill without decoding.
+
+In [batch_infer.py](batch_infer.py), `BatchState` retains state between steps:
 
 1. Left-pads the prompts to `[batch, longest_prompt]`. Each row's final position
    is a real prompt token, so `logits[:, -1, :]` selects the correct next scores.
@@ -49,30 +68,32 @@ Start reading [batch_infer.py](batch_infer.py). `generate_batch_tokens()`:
    `.tolist()` evaluates the batch once. Decode input is `[batch, 1]`.
 4. Tracks each row's EOS, output budget, sampler and token callback independently.
    Completed rows leave the next forward pass. Zero-budget requests are excluded
-   before prefill and still return an empty output at their original position.
-5. Keeps `active_indices` to map each current tensor row to the original request
-   position. After a step, `keep_rows` selects the surviving *current* rows for
+   before prefill and still return an empty output.
+5. Each row holds an `ActiveRequest` containing its original request and generated
+   tokens. After a step, `keep_rows` selects the surviving *current* rows for
    the next input and every layer's `BatchKVCache.filter()`. The filter also
    adjusts padding and RoPE metadata, including removal of shared left padding.
 
-For example, requests A/B/C can shrink from 3 rows to 2 to 1 as they reach EOS
-or their budgets. Results and callbacks still belong to the original requests.
-Trace output from `batch_example.py` shows the shrinking `batch` dimension and current
+For example, `[A, B]` becomes `[A]` when B finishes, then `[A, C]` after C's
+prefill. A keeps its existing KV history. Each row also keeps one sampled token
+that has not entered the model yet; these tokens form the merged decode input.
+Results and callbacks still belong to the original requests.
+Trace output from `continuous_example.py` shows prefill/decode/merge and current
 `request_ids`. KV filtering can copy buffers; removing rows reduces subsequent
 work but does not guarantee a lower peak allocation or instant OS memory release.
 
-`engine.run_batch(N)` removes up to N already queued requests and calls this
-loop. `worker.py` forms groups from async submissions; it never adds a new row
-while a batch is generating. Token callbacks arrive during generation, but final
-request futures all complete at the end of their batch. This deliberately makes
-compaction one separate learning step: new-request admission and early delivery
-of completed request futures are still future work.
+`generate_batch_tokens()` and `engine.run_batch(N)` remain convenient synchronous
+wrappers for finishing one group. The async worker uses the step-level API instead.
+Futures can finish out of submission order; `asyncio.gather()` still returns its
+results in the caller's input order. The staggered example prints completion
+inside each coroutine so the short requests' early return is visible.
 
 `RequestOutput.timing` records the admitted group's `batch_size` and a `batch_id`
-(the first request ID in that group). The active row count can now shrink and
-can start smaller when some budgets are zero; use trace output to inspect it.
+(the first request ID in that group). The active row count can shrink or combine
+several admission groups; zero-budget requests consume no model rows. Use trace
+output to inspect it.
 Invalid requests fail individually before model execution;
-a shared inference failure fails the selected batch, and later batches continue.
+a shared prefill/decode/merge failure fails all active requests; later queued work continues.
 Cancellation skips a request before admission; after admission its generation
 continues to its original EOS/budget condition. Memory probes and shutdown are FIFO barriers.
 
@@ -80,7 +101,7 @@ This stage requires KV caching and `collect_stats=False` when batching is
 enabled. Per-request compute/memory stats cannot attribute shared batch work;
 use `bench.py` for client latency and case-level memory. Padded rows consume
 memory and compute, so similar prompt/output lengths are the simplest first
-comparison. No slot refill or prefix sharing is implemented yet.
+comparison. Slot refill is implemented; prefix sharing is not.
 
 ```bash
 uv run python -m unittest -v test_engine test_client test_bench test_batch_infer
@@ -88,9 +109,10 @@ uv run python -m unittest -v test_engine test_client test_bench test_batch_infer
 
 The tests cover partial batches, failure/cancellation/shutdown, independent
 EOS/budgets, repeated row compaction, output/callback mapping, and zero-budget
-requests. Tiny-Qwen logits after cache filtering are compared with unpadded serial
-inference. The benchmark also compares real model output
-token IDs for mixed lengths/budgets, reordered batches, and a partial batch.
+requests. They verify refill and early completion using real threads/futures.
+Tiny-Qwen logits after cache filtering and merging both longer and shorter
+contexts are compared with unpadded serial inference. The benchmark also compares
+real model outputs for mixed/reordered/partial batches and a late arrival.
 
 Batch and serial execution can use different numerical kernels. With 4-bit
 weights and BF16 activations, close logits can round to a tie and change greedy

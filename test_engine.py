@@ -1,10 +1,14 @@
 """Queue behavior checks without loading model weights."""
 
 import unittest
+from typing import cast
 from unittest.mock import MagicMock, patch
+
+from mlx_lm.models.qwen3 import Model
 
 from engine import InferenceEngine
 from sampler import GreedySampler
+from test_batch_infer import ScriptedModel
 
 
 class InferenceEngineTests(unittest.TestCase):
@@ -139,6 +143,34 @@ class InferenceEngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "use_cache=True"):
             self.engine.run_batch(2)
         self.assertEqual(self.engine.pending_requests, 1)
+
+    def test_stepwise_prefill_refill_zero_budget_and_individual_outputs(self) -> None:
+        self.engine.collect_stats = False
+        self.tokenizer_loader.return_value.pad_token_id = 0
+        self.encoder.side_effect = [[1, 2], [3], [4], [6, 7, 8, 9, 1]]
+        model: ScriptedModel = ScriptedModel([[4, 5], [6, 7], [8], [1, 2], [3]])
+        self.engine.model = cast(Model, model)
+        long_id: int = self.engine.add_request("long", 4)
+        short_id: int = self.engine.add_request("short", 2)
+        self.assertEqual(self.engine.prefill_next(2), [])
+        self.assertEqual(self.engine.active_requests, 2)
+        zero_id: int = self.engine.add_request("zero", 0)
+        zero = self.engine.prefill_next(1)
+        self.assertEqual([(out.request_id, out.token_ids) for out in zero], [(zero_id, [])])
+        self.assertEqual(len(model.inputs), 1)  # Zero budget does not run or disturb active KV.
+        short = self.engine.step()
+        self.assertEqual([(out.request_id, out.token_ids) for out in short], [(short_id, [5, 7])])
+        self.assertEqual(self.engine.active_requests, 1)
+        incoming_id: int = self.engine.add_request("incoming", 2)
+        self.assertEqual(self.engine.prefill_next(1), [])
+        self.assertEqual(self.engine.active_requests, 2)
+        incoming = self.engine.step()
+        self.assertEqual([(out.request_id, out.token_ids) for out in incoming], [(incoming_id, [8, 2])])
+        long = self.engine.step()
+        self.assertEqual([(out.request_id, out.token_ids) for out in long], [(long_id, [4, 6, 1, 3])])
+        self.assertEqual(self.engine.active_requests, 0)
+        self.assertEqual(self.engine.step(), [])
+        self.assertEqual(self.engine.pending_requests, 0)
 
 
 if __name__ == "__main__":

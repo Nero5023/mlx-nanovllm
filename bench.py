@@ -129,6 +129,7 @@ async def check_correctness(
         "one_output_budget": one == cached[0][:1],
     }
     batch_checks: dict[str, object] = {}
+    refill_checks: dict[str, object] = {}
     if max_batch_size > 1:
         mixed_prompts: list[str] = prompts + ["Count from 1 to 20, separated by commas.", "Say hello."]
         budgets: list[int] = [24, 16, 32, 0]
@@ -147,9 +148,34 @@ async def check_correctness(
                 for prompt, budget in reversed(list(zip(mixed_prompts, budgets)))
             ))
             partial: RequestOutput = await client.generate(prompts[0], 24)
+            first_token: asyncio.Event = asyncio.Event()
+
+            def started(event: TokenEvent) -> None:
+                first_token.set()
+
+            long_request: asyncio.Future[RequestOutput] = client.submit(
+                mixed_prompts[2], 32, on_token=started,
+            )
+            # Also wake on failure/early completion instead of waiting forever for a token.
+            long_request.add_done_callback(lambda _: first_token.set())
+            await first_token.wait()
+            newcomer: RequestOutput = await client.generate(prompts[0], 4)
+            long_output: RequestOutput = await long_request
         checks["fixed_batch_equals_serial"] = [out.token_ids for out in batch_outputs] == reference
         checks["reordered_batch_equals_serial"] = [out.token_ids for out in reversed_outputs] == reference[::-1]
         checks["partial_batch_equals_serial"] = partial.token_ids == reference[0]
+        checks["continuous_refill_equals_serial"] = (
+            long_output.token_ids == reference[2] and newcomer.token_ids == reference[0][:4]
+        )
+        checks["newcomer_completes_before_long_request"] = (
+            newcomer.timing is not None and long_output.timing is not None
+            and newcomer.timing.finished_at < long_output.timing.finished_at
+        )
+        refill_checks = {
+            "long_token_ids": long_output.token_ids, "newcomer_token_ids": newcomer.token_ids,
+            "long_timing": asdict(long_output.timing) if long_output.timing else None,
+            "newcomer_timing": asdict(newcomer.timing) if newcomer.timing else None,
+        }
         batch_checks = {
             "prompts": mixed_prompts, "budgets": budgets, "serial_token_ids": reference,
             "batch_token_ids": [out.token_ids for out in batch_outputs],
@@ -161,6 +187,7 @@ async def check_correctness(
         "cached_token_ids": cached, "uncached_token_ids": uncached,
         "scope": "Regression checks, not an independent model-quality oracle.",
         "fixed_batch": batch_checks,
+        "continuous_refill": refill_checks,
     }
 
 
@@ -197,9 +224,11 @@ def metadata(
             for path in sorted(model_path.iterdir())
             if path.suffix in {".json", ".safetensors"}
         },
-        "backend": "compacting-batch-worker" if max_batch_size > 1 else "fifo-worker",
+        "backend": "continuous-batch-worker" if max_batch_size > 1 else "fifo-worker",
         "batch_compaction": max_batch_size > 1,
-        "batch_size_scope": "Admitted group size, not the number of active rows at each decode step.",
+        "continuous_batching": max_batch_size > 1,
+        "batch_size_scope": "Newly admitted group size; decode can merge survivors from several groups.",
+        "prefill_policy": "Whole incoming group; active decode pauses during prefill; no chunking.",
         "max_active_requests": max_batch_size,
         "batch_wait_ms": batch_wait_ms if max_batch_size > 1 else 0.0,
         "use_kv_cache": use_cache, "prefix_reuse": False, "paged_kv": False,
@@ -239,7 +268,7 @@ def write_report(
         "TTFT includes queueing and client notification. ITL pools consecutive token gaps; "
         "TPOT averages gaps per request. Values are milliseconds. Throughput is the median "
         "of per-repeat output tokens / total workload wall time; memory is the maximum across repeats.", "",
-        "| Case | Runs | OK / all | Admitted batch sizes | TTFT p50 / p95 | ITL p50 / p95 | TPOT p50 | Queue p50 | Output tok/s p50 | Peak GB |",
+        "| Case | Runs | OK / all | Admission group sizes | TTFT p50 / p95 | ITL p50 / p95 | TPOT p50 | Queue p50 | Output tok/s p50 | Peak GB |",
         "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for case in cases:
@@ -283,7 +312,7 @@ def write_report(
         "These are short synthetic workloads, not steady-state production load. Small-sample "
         "tail percentiles are descriptive. No GPU utilization or hardware capacity limit is measured. "
         "Queued requests have no active KV cache; active batch rows do. Concurrency is client "
-        "in-flight work; admitted group sizes do not track shrinking decode tensors.", "",
+        "in-flight work; admission group sizes do not track growing/shrinking decode tensors.", "",
         "The largest successful context/concurrency is only the largest tested configuration. "
         "Prefix scenarios measure the current baseline; this backend has no cross-request prefix cache.", "",
         "See BENCHMARKS.md for formulas, workload purposes and backend comparison rules.",
@@ -347,8 +376,8 @@ def main() -> None:
     parser.add_argument("--case", action="append", help="Select a case; can be repeated.")
     parser.add_argument("--max-prompt-tokens", type=int, default=2048)
     parser.add_argument("--max-concurrency", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=1, help="Max admitted group size; finished rows compact during decode. 1 keeps serial execution.")
-    parser.add_argument("--batch-wait-ms", type=float, default=2.0, help="Max collection wait before starting a partial batch.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Max active rows with continuous refill. 1 keeps serial execution.")
+    parser.add_argument("--batch-wait-ms", type=float, default=2.0, help="Max collection wait when idle; active decode never waits to fill slots.")
     parser.add_argument("--no-cache", action="store_true", help="Full-prefix recomputation ablation.")
     parser.add_argument("--output", type=Path, default=Path("benchmarks") / f"suite-{uuid4().hex[:12]}")
     args: argparse.Namespace = parser.parse_args()
@@ -357,7 +386,7 @@ def main() -> None:
     if args.batch_size < 1 or not isfinite(args.batch_wait_ms) or args.batch_wait_ms < 0:
         parser.error("batch-size must be >= 1; batch-wait-ms must be finite and >= 0")
     if args.batch_size > 1 and args.no_cache:
-        parser.error("Fixed batching requires KV caching; --no-cache only supports batch-size=1")
+        parser.error("Batching requires KV caching; --no-cache only supports batch-size=1")
     if (args.output / "results.json").exists():
         parser.error("Output already contains results.json; choose a new directory.")
     asyncio.run(main_async(args))

@@ -23,7 +23,20 @@ class EngineState:
     block_loading: bool = False
     calls: list[str] = field(default_factory=list)
     batches: list[list[str]] = field(default_factory=list)
+    decode_batches: list[list[str]] = field(default_factory=list)
+    block_decode_at: int | None = None
+    decoding: threading.Event = field(default_factory=threading.Event)
+    decode_release: threading.Event = field(default_factory=threading.Event)
     thread_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class FakeRequest:
+    request_id: int
+    prompt: str
+    max_tokens: int
+    on_token: TokenCallback | None
+    token_ids: list[int] = field(default_factory=list)
 
 
 class FakeEngine:
@@ -34,7 +47,8 @@ class FakeEngine:
         if state.block_loading and not state.loaded.wait(timeout=5):
             raise TimeoutError("Test did not release model loading.")
         self.next_id: int = 0
-        self.waiting: list[tuple[int, str, TokenCallback | None]] = []
+        self.waiting: list[FakeRequest] = []
+        self.active: list[FakeRequest] = []
 
     def add_request(
         self, prompt: str, max_tokens: int, *, sampler: Sampler | None,
@@ -43,7 +57,7 @@ class FakeEngine:
         self.state.thread_ids.append(threading.get_ident())
         if max_tokens < 0:
             raise ValueError("negative budget")
-        self.waiting.append((self.next_id, prompt, on_token))
+        self.waiting.append(FakeRequest(self.next_id, prompt, max_tokens, on_token))
         self.next_id += 1
         return self.next_id - 1
 
@@ -51,25 +65,64 @@ class FakeEngine:
         self.state.thread_ids.append(threading.get_ident())
         return self._complete(self.waiting.pop(0))
 
-    def run_batch(self, max_batch_size: int) -> list[RequestOutput]:
+    @property
+    def active_requests(self) -> int:
+        return len(self.active)
+
+    def prefill_next(self, max_batch_size: int) -> list[RequestOutput]:
         self.state.thread_ids.append(threading.get_ident())
         selected = self.waiting[:max_batch_size]
         del self.waiting[:max_batch_size]
-        self.state.batches.append([item[1] for item in selected])
-        return [self._complete(item) for item in selected]
+        self.state.batches.append([item.prompt for item in selected])
+        for item in selected:
+            self._start(item)
+        finished, surviving = self._advance(selected)
+        self.active.extend(surviving)
+        return finished
 
-    def _complete(self, item: tuple[int, str, TokenCallback | None]) -> RequestOutput:
-        request_id, prompt, on_token = item
-        self.state.calls.append(prompt)
-        if prompt == "blocked":
+    def step(self) -> list[RequestOutput]:
+        self.state.thread_ids.append(threading.get_ident())
+        self.state.decode_batches.append([item.prompt for item in self.active])
+        if len(self.state.decode_batches) == self.state.block_decode_at:
+            self.state.decoding.set()
+            if not self.state.decode_release.wait(timeout=5):
+                raise TimeoutError("Test did not release decode.")
+        finished, self.active = self._advance(self.active)
+        return finished
+
+    def abort_batch(self) -> None:
+        self.active.clear()
+
+    def _advance(self, items: list[FakeRequest]) -> tuple[list[RequestOutput], list[FakeRequest]]:
+        finished: list[RequestOutput] = []
+        surviving: list[FakeRequest] = []
+        for item in items:
+            if len(item.token_ids) < item.max_tokens:
+                item.token_ids.append(item.request_id)
+                if item.on_token is not None:
+                    item.on_token(TokenEvent(item.request_id, perf_counter()))
+            if len(item.token_ids) == item.max_tokens:
+                finished.append(RequestOutput(
+                    item.request_id, item.prompt, f"answer:{item.prompt}", item.token_ids, None,
+                ))
+            else:
+                surviving.append(item)
+        return finished, surviving
+
+    def _start(self, item: FakeRequest) -> None:
+        self.state.calls.append(item.prompt)
+        if item.prompt == "blocked":
             self.state.started.set()
             if not self.state.release.wait(timeout=5):
                 raise TimeoutError("Test did not release inference.")
-        if prompt == "error":
+        if item.prompt == "error":
             raise ValueError("request failed")
-        if on_token is not None:
-            on_token(TokenEvent(request_id, perf_counter()))
-        return RequestOutput(request_id, prompt, f"answer:{prompt}", [request_id], None)
+
+    def _complete(self, item: FakeRequest) -> RequestOutput:
+        self._start(item)
+        if item.on_token is not None:
+            item.on_token(TokenEvent(item.request_id, perf_counter()))
+        return RequestOutput(item.request_id, item.prompt, f"answer:{item.prompt}", [item.request_id], None)
 
 
 class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
@@ -228,7 +281,7 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             client.submit("after failure")
 
-    async def test_fixed_batches_do_not_admit_arrivals_during_generation(self) -> None:
+    async def test_full_batch_waits_for_a_slot_and_preserves_fifo_admission(self) -> None:
         async with InferenceClient(max_batch_size=2, batch_wait_ms=100) as client:
             first = client.submit("blocked")
             second = client.submit("second")
@@ -247,6 +300,48 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([out.timing.batch_size for out in outputs if out.timing], [2] * 4)
         self.assertEqual([out.timing.batch_id for out in outputs if out.timing], [0, 0, 2, 2])
         self.assertEqual(len(set(self.state.thread_ids)), 1)
+
+    async def test_finished_result_returns_and_queued_request_replaces_it_before_long_request_finishes(self) -> None:
+        self.state.block_decode_at = 2
+        events: list[TokenEvent] = []
+        async with InferenceClient(max_batch_size=2, batch_wait_ms=100) as client:
+            long = client.submit("blocked", max_tokens=8)
+            short = client.submit("short", max_tokens=2, on_token=events.append)
+            try:
+                await self.wait_for_event(self.state.started)
+                replacement = client.submit("replacement", max_tokens=2)
+                self.state.release.set()
+                await self.wait_for_event(self.state.decoding)
+                result = await asyncio.wait_for(asyncio.shield(short), 2)
+                self.assertEqual([event.token_id for event in events], result.token_ids)
+                self.assertFalse(long.done())
+                self.assertEqual(self.state.batches, [["blocked", "short"], ["replacement"]])
+                self.assertEqual(self.state.decode_batches[1], ["blocked", "replacement"])
+            finally:
+                self.state.release.set()
+                self.state.decode_release.set()
+            outputs = await asyncio.wait_for(asyncio.gather(long, replacement), 2)
+        self.assertEqual([len(output.token_ids) for output in outputs], [8, 2])
+        self.assertTrue(all(len(rows) <= 2 for rows in self.state.decode_batches))
+        assert result.timing is not None and outputs[0].timing is not None
+        self.assertLess(result.timing.finished_at, outputs[0].timing.finished_at)
+
+    async def test_arrival_joins_an_underfilled_active_batch(self) -> None:
+        self.state.block_decode_at = 2
+        async with InferenceClient(max_batch_size=3, batch_wait_ms=0) as client:
+            first = client.submit("blocked", max_tokens=6)
+            try:
+                await self.wait_for_event(self.state.started)
+                newcomer = client.submit("newcomer", max_tokens=2)
+                self.state.release.set()
+                await self.wait_for_event(self.state.decoding)
+                self.assertEqual(self.state.decode_batches[1], ["blocked", "newcomer"])
+                self.assertFalse(first.done())
+            finally:
+                self.state.release.set()
+                self.state.decode_release.set()
+            outputs = await asyncio.wait_for(asyncio.gather(first, newcomer), 2)
+        self.assertEqual([len(output.token_ids) for output in outputs], [6, 2])
 
     async def test_partial_batch_and_invalid_request_make_progress(self) -> None:
         async with InferenceClient(max_batch_size=4, batch_wait_ms=5) as client:
@@ -268,6 +363,19 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(isinstance(result, ValueError) for result in results))
             self.assertEqual((await client.generate("later")).prompt, "later")
 
+    async def test_incoming_prefill_failure_fails_active_requests_and_worker_recovers(self) -> None:
+        async with InferenceClient(max_batch_size=2, batch_wait_ms=0) as client:
+            active = client.submit("blocked", max_tokens=8)
+            try:
+                await self.wait_for_event(self.state.started)
+                incoming = client.submit("error")
+                later = client.submit("later", max_tokens=1)
+            finally:
+                self.state.release.set()
+            results = await asyncio.wait_for(asyncio.gather(active, incoming, return_exceptions=True), 2)
+            self.assertTrue(all(isinstance(result, ValueError) for result in results))
+            self.assertEqual((await asyncio.wait_for(later, 2)).prompt, "later")
+
     async def test_memory_probe_is_a_batch_barrier(self) -> None:
         observed_calls: list[list[str]] = []
         with (
@@ -276,13 +384,13 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
             patch("worker.mx.get_active_memory", return_value=100),
             patch("worker.mx.get_cache_memory", return_value=50),
         ):
-            async with InferenceClient(max_batch_size=4, batch_wait_ms=100) as client:
+            async with InferenceClient(max_batch_size=4, batch_wait_ms=0) as client:
                 first = client.submit("blocked")
-                probe = asyncio.create_task(client.memory_snapshot())
                 try:
+                    await self.wait_for_event(self.state.started)
+                    probe = asyncio.create_task(client.memory_snapshot())
                     await asyncio.sleep(0)  # Put the probe in the FIFO before the next request.
                     second = client.submit("after probe")
-                    await self.wait_for_event(self.state.started)
                     self.assertFalse(probe.done())
                 finally:
                     self.state.release.set()

@@ -1,4 +1,4 @@
-"""One model-owning thread serving FIFO requests individually or in batches."""
+"""One model-owning thread: FIFO admission, continuous decode, individual results."""
 
 from concurrent.futures import Future
 from collections import deque
@@ -36,6 +36,14 @@ class _MemoryProbe:
     clear_cache: bool = False
 
 
+@dataclass(frozen=True)
+class _RunningRequest:
+    item: _WorkItem
+    started_at: float
+    batch_size: int  # Size of this request's prefill/admission group.
+    batch_id: int
+
+
 class InferenceWorker:
     def __init__(
         self,
@@ -52,10 +60,12 @@ class InferenceWorker:
         if not isfinite(batch_wait_ms) or batch_wait_ms < 0:
             raise ValueError("batch_wait_ms must be finite and nonnegative.")
         if max_batch_size > 1 and (not use_cache or collect_stats):
-            raise ValueError("Fixed batches require use_cache=True and collect_stats=False.")
+            raise ValueError("Batching requires use_cache=True and collect_stats=False.")
         self._max_batch_size: int = max_batch_size
         self._batch_wait_seconds: float = batch_wait_ms / 1000
         self._queue: Queue[_WorkItem | _MemoryProbe | None] = Queue()
+        # Accessed only by the worker thread after initialization.
+        self._running: dict[int, _RunningRequest] = {}
         self._ready: Future[None] = Future()
         self._lock: Lock = Lock()
         self._started: bool = False
@@ -147,9 +157,86 @@ class InferenceWorker:
             return
         self._ready.set_result(None)
 
+        if self._max_batch_size > 1:
+            self._run_continuous(engine)
+            return
         deferred: deque[_MemoryProbe | None] = deque()
         while (items := self._next_batch(deferred)) is not None:
             self._run_requests(engine, items)
+
+    def _run_continuous(self, engine: InferenceEngine) -> None:
+        deferred: deque[_MemoryProbe | None] = deque()
+        while True:
+            if not self._running:
+                items: list[_WorkItem] | None = self._next_batch(deferred)
+                if items is None:
+                    return
+            else:
+                # Never wait to fill slots while existing requests need decode.
+                items = self._take_ready(deferred, self._max_batch_size - len(self._running))
+            admitted: int = self._admit_requests(engine, items)
+            try:
+                if admitted:
+                    # Do prefil here, but not very ideal, other requests need to wait this to be refilled first.
+                    self._deliver_results(engine.prefill_next(admitted))
+                if engine.active_requests:
+                    self._deliver_results(engine.step())
+                if len(self._running) != engine.active_requests:
+                    raise RuntimeError("Active rows and outstanding request results disagree.")
+            except BaseException as error:
+                # A prefill/decode/merge failure invalidates the shared active batch.
+                engine.abort_batch()
+                for state in self._running.values():
+                    state.item.future.set_exception(error)
+                self._running.clear()
+
+    def _take_ready(
+        self, deferred: deque[_MemoryProbe | None], slots: int,
+    ) -> list[_WorkItem]:
+        """Read ready requests without crossing a memory/shutdown barrier."""
+        items: list[_WorkItem] = []
+        while len(items) < slots and not deferred:
+            try:
+                item: _WorkItem | _MemoryProbe | None = self._queue.get_nowait()
+            except Empty:
+                break
+            if item is not None and item.future.cancelled():
+                continue
+            if not isinstance(item, _WorkItem):
+                deferred.append(item)  # Drain earlier active work before the control message.
+                break
+            items.append(item)
+        return items
+
+    def _admit_requests(
+        self, engine: InferenceEngine, items: list[_WorkItem],
+    ) -> int:
+        started_at: float = perf_counter()
+        accepted: list[tuple[int, _WorkItem]] = []
+        for item in items:
+            if not item.future.set_running_or_notify_cancel():
+                continue
+            try:
+                request_id: int = engine.add_request(
+                    item.prompt, item.max_tokens, sampler=item.sampler,
+                    on_token=item.on_token, ignore_eos=item.ignore_eos,
+                )
+            except BaseException as error:
+                item.future.set_exception(error)
+            else:
+                accepted.append((request_id, item))
+        for request_id, item in accepted:
+            self._running[request_id] = _RunningRequest(item, started_at, len(accepted), accepted[0][0])
+        return len(accepted)
+
+    def _deliver_results(self, outputs: list[RequestOutput]) -> None:
+        """Deliver completed engine outputs to their callers with request timing."""
+        for output in outputs:
+            state: _RunningRequest = self._running.pop(output.request_id)
+            state.item.future.set_result(replace(output, timing=RequestTiming(
+                state.item.enqueued_at, state.started_at, perf_counter(),
+                batch_size=state.batch_size, batch_id=state.batch_id,
+            )))
 
     def _next_batch(
         self, deferred: deque[_MemoryProbe | None],
@@ -225,12 +312,8 @@ class InferenceWorker:
         if not running:
             return
         try:
-            outputs: list[RequestOutput]
-            if self._max_batch_size == 1:
-                output: RequestOutput | None = engine.run_next()
-                outputs = [output] if output is not None else []
-            else:
-                outputs = engine.run_batch(len(running))
+            output: RequestOutput | None = engine.run_next()
+            outputs: list[RequestOutput] = [output] if output is not None else []
             if len(outputs) != len(running):
                 raise RuntimeError("The submitted requests produced an incomplete batch.")
         except BaseException as error:

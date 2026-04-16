@@ -18,7 +18,7 @@ class RequestTiming:
     enqueued_at: float
     started_at: float  # Before tokenization, after leaving the worker queue.
     finished_at: float
-    batch_size: int = 1  # Admitted group size; active model rows may shrink during decode.
+    batch_size: int = 1  # Newly admitted group size; active decode may combine several groups.
     batch_id: int | None = None
 
 
