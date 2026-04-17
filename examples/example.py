@@ -1,6 +1,6 @@
 """Queue several prompts and serve them one at a time with one loaded model."""
 
-from engine import InferenceEngine
+from mlx_nano_llm.engine import InferenceEngine
 
 
 def main() -> None:

@@ -16,12 +16,12 @@ from typing import Protocol
 
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from bench_metrics import Observation, distribution, summarize
-from bench_workloads import Case, RequestSpec, build_cases, common_prefix_tokens, make_request
-from client import InferenceClient
-from infer import DEFAULT_MODEL
-from request import RequestOutput
-from telemetry import MemorySnapshot, TokenCallback, TokenEvent
+from mlx_nano_llm.benchmarks.metrics import Observation, distribution, summarize
+from mlx_nano_llm.benchmarks.workloads import Case, RequestSpec, build_cases, common_prefix_tokens, make_request
+from mlx_nano_llm.client import InferenceClient
+from mlx_nano_llm.infer import DEFAULT_MODEL
+from mlx_nano_llm.request import RequestOutput
+from mlx_nano_llm.telemetry import MemorySnapshot, TokenCallback, TokenEvent
 
 
 class BenchmarkBackend(Protocol):
@@ -204,9 +204,10 @@ def command_output(arguments: list[str]) -> str | None:
 def metadata(
     model_path: Path, use_cache: bool, max_batch_size: int = 1, batch_wait_ms: float = 2.0,
 ) -> dict[str, object]:
+    source_root = Path(__file__).resolve().parents[2]
     source_hashes: dict[str, str] = {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted(Path(__file__).parent.glob("*.py"))
+        str(path.relative_to(source_root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted((source_root / "mlx_nano_llm").rglob("*.py"))
     }
     return {
         "git_commit": command_output(["git", "rev-parse", "HEAD"]),

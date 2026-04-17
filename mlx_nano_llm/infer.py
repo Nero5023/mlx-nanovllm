@@ -13,12 +13,12 @@ from mlx_lm.models.qwen3 import Model as Qwen3Model
 from mlx_lm.utils import load_model
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from benchmark import BenchmarkStats
-from sampler import GreedySampler, Sampler
-from telemetry import TokenCallback, TokenEvent
+from mlx_nano_llm.benchmark import BenchmarkStats
+from mlx_nano_llm.sampler import GreedySampler, Sampler
+from mlx_nano_llm.telemetry import TokenCallback, TokenEvent
 
 
-DEFAULT_MODEL: Path = Path(__file__).parent / "models" / "Qwen3-0.6B-4bit"
+DEFAULT_MODEL: Path = Path(__file__).resolve().parents[1] / "models" / "Qwen3-0.6B-4bit"
 
 
 def encode_prompt(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:

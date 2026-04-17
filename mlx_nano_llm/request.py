@@ -2,9 +2,9 @@
 
 from dataclasses import dataclass
 
-from benchmark import BenchmarkStats
-from sampler import Sampler
-from telemetry import RequestTiming, TokenCallback
+from mlx_nano_llm.benchmark import BenchmarkStats
+from mlx_nano_llm.sampler import Sampler
+from mlx_nano_llm.telemetry import RequestTiming, TokenCallback
 
 
 @dataclass(frozen=True)

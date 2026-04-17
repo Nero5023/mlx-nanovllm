@@ -7,11 +7,11 @@ import mlx.core as mx
 from mlx_lm.models.cache import BatchKVCache, KVCache
 from mlx_lm.models.qwen3 import Model, ModelArgs
 
-from batch_infer import ActiveRequest, BatchState, generate_batch_tokens
-from infer import generate_tokens
-from request import Request
-from sampler import GreedySampler, Sampler
-from telemetry import TokenEvent
+from mlx_nano_llm.batch_infer import ActiveRequest, BatchState, generate_batch_tokens
+from mlx_nano_llm.infer import generate_tokens
+from mlx_nano_llm.request import Request
+from mlx_nano_llm.sampler import GreedySampler, Sampler
+from mlx_nano_llm.telemetry import TokenEvent
 
 
 class ScriptedModel:

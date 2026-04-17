@@ -8,10 +8,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from client import InferenceClient
-from request import RequestOutput
-from sampler import Sampler
-from telemetry import TokenCallback, TokenEvent
+from mlx_nano_llm.client import InferenceClient
+from mlx_nano_llm.request import RequestOutput
+from mlx_nano_llm.sampler import Sampler
+from mlx_nano_llm.telemetry import TokenCallback, TokenEvent
 
 
 @dataclass
@@ -135,7 +135,7 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
             return FakeEngine(self.state)
 
         self.factory: MagicMock = self.enterContext(
-            patch("worker.InferenceEngine", side_effect=create_engine)
+            patch("mlx_nano_llm.worker.InferenceEngine", side_effect=create_engine)
         )
 
     async def wait_for_event(self, event: threading.Event) -> None:
@@ -196,12 +196,12 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
             probe_threads.append(threading.get_ident())
 
         with (
-            patch("worker.mx.synchronize", side_effect=synchronize),
-            patch("worker.mx.reset_peak_memory") as reset,
-            patch("worker.mx.clear_cache") as clear,
-            patch("worker.mx.get_peak_memory", return_value=200),
-            patch("worker.mx.get_active_memory", return_value=100),
-            patch("worker.mx.get_cache_memory", return_value=50),
+            patch("mlx_nano_llm.worker.mx.synchronize", side_effect=synchronize),
+            patch("mlx_nano_llm.worker.mx.reset_peak_memory") as reset,
+            patch("mlx_nano_llm.worker.mx.clear_cache") as clear,
+            patch("mlx_nano_llm.worker.mx.get_peak_memory", return_value=200),
+            patch("mlx_nano_llm.worker.mx.get_active_memory", return_value=100),
+            patch("mlx_nano_llm.worker.mx.get_cache_memory", return_value=50),
         ):
             async with InferenceClient() as client:
                 await client.memory_snapshot(reset_peak=True, clear_cache=True)
@@ -379,10 +379,10 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_memory_probe_is_a_batch_barrier(self) -> None:
         observed_calls: list[list[str]] = []
         with (
-            patch("worker.mx.synchronize", side_effect=lambda: observed_calls.append(self.state.calls.copy())),
-            patch("worker.mx.get_peak_memory", return_value=200),
-            patch("worker.mx.get_active_memory", return_value=100),
-            patch("worker.mx.get_cache_memory", return_value=50),
+            patch("mlx_nano_llm.worker.mx.synchronize", side_effect=lambda: observed_calls.append(self.state.calls.copy())),
+            patch("mlx_nano_llm.worker.mx.get_peak_memory", return_value=200),
+            patch("mlx_nano_llm.worker.mx.get_active_memory", return_value=100),
+            patch("mlx_nano_llm.worker.mx.get_cache_memory", return_value=50),
         ):
             async with InferenceClient(max_batch_size=4, batch_wait_ms=0) as client:
                 first = client.submit("blocked")

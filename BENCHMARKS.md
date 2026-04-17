@@ -9,22 +9,22 @@ Workloads stay separate from scheduling so the same requests compare each stage.
 
 ```bash
 # All main scenarios, three repeats each.
-uv run python bench.py --output benchmarks/fifo-baseline
+uv run python -m mlx_nano_llm.benchmarks.runner --output benchmarks/fifo-baseline
 
 # Same workloads, up to four active rows. Idle collection wait: 2 ms.
-uv run python bench.py --batch-size 4 --output benchmarks/continuous-batch-4
+uv run python -m mlx_nano_llm.benchmarks.runner --batch-size 4 --output benchmarks/continuous-batch-4
 
 # Add adjacent-length cases for allocation/kernel changes.
-uv run python bench.py --profile full --repeats 3 \
+uv run python -m mlx_nano_llm.benchmarks.runner --profile full --repeats 3 \
   --max-concurrency 4 --max-prompt-tokens 2048 \
   --output benchmarks/fifo-full
 
 # Select a smaller comparison, or increase the bounded sweep.
-uv run python bench.py --case burst-1 --case burst-4
-uv run python bench.py --max-concurrency 8 --max-prompt-tokens 4096
-uv run python bench.py --case single --no-cache
+uv run python -m mlx_nano_llm.benchmarks.runner --case burst-1 --case burst-4
+uv run python -m mlx_nano_llm.benchmarks.runner --max-concurrency 8 --max-prompt-tokens 4096
+uv run python -m mlx_nano_llm.benchmarks.runner --case single --no-cache
 
-uv run python -m unittest -v test_engine test_client test_bench test_batch_infer
+uv run python -m unittest -v tests.test_engine tests.test_client tests.test_bench tests.test_batch_infer
 ```
 
 Output directories contain `summary.md` and `results.json`. Existing results
@@ -84,7 +84,7 @@ cache bytes separately at case boundaries. These are not process RSS or total
 physical-memory usage. MLX counters are process-wide: run one backend at a time
 and keep the older per-request `collect_stats` disabled during this suite.
 
-The previous `infer.py --benchmark` still measures prefill and decode compute
+The previous `python -m mlx_nano_llm.infer --benchmark` still measures prefill and decode compute
 regions. Its throughput excludes serving overhead and uses a different scope;
 compare equivalent commands/workloads when assessing regressions.
 
@@ -151,10 +151,10 @@ GPU utilization is not directly measured and is recorded as `null`.
 
 ## Code reading order and future backends
 
-1. `bench_workloads.py`: `Case` / `RequestSpec` and deterministic arrivals.
-2. `bench.py`: `run_case()` sends requests and records observations.
-3. `bench_metrics.py`: formulas and percentile calculations.
-4. `telemetry.py`, then `client.py` / `worker.py` / `infer.py`: timestamp path.
+1. `mlx_nano_llm/benchmarks/workloads.py`: `Case` / `RequestSpec` and deterministic arrivals.
+2. `mlx_nano_llm/benchmarks/runner.py`: `run_case()` sends requests and records observations.
+3. `mlx_nano_llm/benchmarks/metrics.py`: formulas and percentile calculations.
+4. `mlx_nano_llm/telemetry.py`, then `mlx_nano_llm/client.py` / `mlx_nano_llm/worker.py` / `mlx_nano_llm/infer.py`: timestamp path.
 
 `BenchmarkBackend` needs `generate(..., on_token=..., ignore_eos=...)` and
 `memory_snapshot(...)`. Future batching engines can implement this protocol

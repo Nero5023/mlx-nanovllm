@@ -9,8 +9,24 @@ inference baseline, environment, and benchmark result. Code and report are tagge
 
 The `v0.2` tag records the async FIFO worker and serving benchmark baseline.
 The `v0.3` tag records fixed batching and its benchmark comparison. `v0.3.5`
-adds batch compaction. The current step adds continuous admission: completed
+adds batch compaction. `v0.4` adds continuous admission: completed
 requests return immediately, and queued requests fill available decode slots.
+
+## Project layout
+
+```text
+mlx_nano_llm/             Inference engine, worker, client, sampling and telemetry
+  benchmarks/            Serving benchmark runner, workloads and metrics
+examples/                Synchronous, async and batched usage
+tests/                   Unit and regression tests
+reports/                 Versioned benchmark results and comparisons
+models/                  Local model weights (ignored by Git)
+benchmarks/              Local benchmark output (ignored by Git)
+```
+
+Run commands from the repository root with `uv run python -m ...`.
+Run all tests with `uv run python -m unittest discover -v`.
+The [v0.4 report](reports/v0.4/README.md) compares serial and continuous serving.
 
 ## Continuous batching
 
@@ -19,12 +35,15 @@ the earlier serial comparison, raw observations, and BF16 numerical differences.
 Those measurements predate compaction.
 
 ```bash
-uv run python batch_example.py
-uv run python continuous_example.py
-uv run python bench.py --batch-size 4 --repeats 3
+uv run python -m examples.batch_example
+uv run python -m examples.continuous_example
+uv run python -m mlx_nano_llm.benchmarks.runner --batch-size 4 --repeats 3
 ```
 
 ```python
+import asyncio
+from mlx_nano_llm.client import InferenceClient
+
 async with InferenceClient(max_batch_size=4, batch_wait_ms=2.0) as client:
     outputs = await asyncio.gather(
         client.generate("What is the capital of France?", max_tokens=24),
@@ -41,7 +60,7 @@ already queued work. Collection wait is included in queue time and TTFT.
 While requests are active, it checks the queue without waiting at each decode
 boundary. A full batch keeps decoding until a slot becomes available.
 
-Start reading [worker.py](worker.py), `_run_continuous()`. Each iteration:
+Start reading [worker.py](mlx_nano_llm/worker.py), `_run_continuous()`. Each iteration:
 
 1. Takes FIFO requests for the available slots (no collection wait when active).
 2. Calls `engine.prefill_next()` to prefill incoming prompts separately and
@@ -57,7 +76,7 @@ This first implementation has no chunked prefill, prefix reuse, or paged KV.
 Every iteration advances existing requests even if incoming short requests keep
 arriving; the scheduler does not continually prefill without decoding.
 
-In [batch_infer.py](batch_infer.py), `BatchState` retains state between steps:
+In [batch_infer.py](mlx_nano_llm/batch_infer.py), `BatchState` retains state between steps:
 
 1. Left-pads the prompts to `[batch, longest_prompt]`. Each row's final position
    is a real prompt token, so `logits[:, -1, :]` selects the correct next scores.
@@ -78,7 +97,7 @@ For example, `[A, B]` becomes `[A]` when B finishes, then `[A, C]` after C's
 prefill. A keeps its existing KV history. Each row also keeps one sampled token
 that has not entered the model yet; these tokens form the merged decode input.
 Results and callbacks still belong to the original requests.
-Trace output from `continuous_example.py` shows prefill/decode/merge and current
+Trace output from `examples/continuous_example.py` shows prefill/decode/merge and current
 `request_ids`. KV filtering can copy buffers; removing rows reduces subsequent
 work but does not guarantee a lower peak allocation or instant OS memory release.
 
@@ -99,12 +118,12 @@ continues to its original EOS/budget condition. Memory probes and shutdown are F
 
 This stage requires KV caching and `collect_stats=False` when batching is
 enabled. Per-request compute/memory stats cannot attribute shared batch work;
-use `bench.py` for client latency and case-level memory. Padded rows consume
+use `mlx_nano_llm/benchmarks/runner.py` for client latency and case-level memory. Padded rows consume
 memory and compute, so similar prompt/output lengths are the simplest first
 comparison. Slot refill is implemented; prefix sharing is not.
 
 ```bash
-uv run python -m unittest -v test_engine test_client test_bench test_batch_infer
+uv run python -m unittest -v tests.test_engine tests.test_client tests.test_bench tests.test_batch_infer
 ```
 
 The tests cover partial batches, failure/cancellation/shutdown, independent
@@ -125,8 +144,8 @@ and inspect logits at the first divergence when comparing other workloads.
 
 ```bash
 uv sync --locked
-uv run python infer.py "What is the capital of France?" --max-tokens 32
-uv run python infer.py "What is the capital of France?" --max-tokens 8 --trace
+uv run python -m mlx_nano_llm.infer "What is the capital of France?" --max-tokens 32
+uv run python -m mlx_nano_llm.infer "What is the capital of France?" --max-tokens 8 --trace
 ```
 
 Python 3.12 is pinned in `.python-version`. Model files are already downloaded
@@ -144,12 +163,12 @@ The weights use 4-bit quantization; the KV cache uses the model's activation dty
 ## Async clients and one worker
 
 ```bash
-uv run python async_example.py
+uv run python -m examples.async_example
 ```
 
 ```python
 import asyncio
-from client import InferenceClient
+from mlx_nano_llm.client import InferenceClient
 
 async def main() -> None:
     async with InferenceClient() as client:
@@ -161,12 +180,12 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`client.py` runs on the asyncio event loop. `submit()` enqueues raw text and
+`mlx_nano_llm/client.py` runs on the asyncio event loop. `submit()` enqueues raw text and
 immediately returns an awaitable future; `await client.generate(...)` is a
 convenience for submitting and awaiting one result. Multiple coroutines share
 one client. They can submit while an earlier request is generating.
 
-With the default batch size of 1, `worker.py` owns a thread-safe FIFO queue and one dedicated thread. That thread
+With the default batch size of 1, `mlx_nano_llm/worker.py` owns a thread-safe FIFO queue and one dedicated thread. That thread
 loads the model/tokenizer once, tokenizes each request, and calls the synchronous
 engine's `add_request()` and `run_next()`. Every model operation stays on this
 thread. Results and exceptions cross back through `concurrent.futures.Future`
@@ -178,7 +197,7 @@ async clients -> thread-safe queue -> one model-owning worker thread
       +---------- per-request future ----+
 ```
 
-`async_example.py` submits B and C shortly after A. Its timestamps show them
+`examples/async_example.py` submits B and C shortly after A. Its timestamps show them
 arriving while A runs, then completing in order. Displayed latency includes
 queueing and execution; this is an in-process example with whole-response output.
 
@@ -203,7 +222,7 @@ opt-in fixed-output-budget mode for benchmarks; ordinary requests stop at EOS.
 Run the queue and concurrency checks with:
 
 ```bash
-uv run python -m unittest -v test_engine test_client
+uv run python -m unittest -v tests.test_engine tests.test_client
 ```
 
 These tests use a stand-in engine with real threads/futures, including blocked
@@ -213,11 +232,11 @@ runs the real Qwen model.
 ## Synchronous engine
 
 ```bash
-uv run python example.py
+uv run python -m examples.example
 ```
 
 ```python
-from engine import InferenceEngine
+from mlx_nano_llm.engine import InferenceEngine
 
 engine = InferenceEngine()  # Load model and tokenizer once.
 first_id = engine.add_request("What is the capital of France?", max_tokens=32)
@@ -242,15 +261,15 @@ This is a synchronous Python interface: `run_next()` runs one request and
 Invalid requests are rejected before enqueueing. If inference raises an error,
 it propagates; the failed request is removed and later requests remain queued.
 
-Read `request.py` for the request/output data, `engine.py` for queue management,
-and `infer.py` for the generation loop. `pending_requests` gives the queue length.
+Read `mlx_nano_llm/request.py` for the request/output data, `mlx_nano_llm/engine.py` for queue management,
+and `mlx_nano_llm/infer.py` for the generation loop. `pending_requests` gives the queue length.
 The engine also accepts `use_cache=False`, `trace=True`, and `collect_stats=True`.
 With statistics enabled, each output has its own `BenchmarkStats`; these include
 the first request's cold-start costs because the engine does not run a warmup.
 Use the benchmark command below for a warmed measurement.
 
-Run queue behavior checks with `uv run python -m unittest -v test_engine`.
-These use stand-ins for model loading and generation; `example.py` runs the real model.
+Run queue behavior checks with `uv run python -m unittest -v tests.test_engine`.
+These use stand-ins for model loading and generation; `examples/example.py` runs the real model.
 
 ## Small benchmark
 
@@ -258,7 +277,7 @@ For multi-request TTFT, inter-token latency, total throughput, and peak memory,
 use the [serving benchmark suite](BENCHMARKS.md):
 
 ```bash
-uv run python bench.py --profile full --repeats 3
+uv run python -m mlx_nano_llm.benchmarks.runner --profile full --repeats 3
 ```
 
 It saves raw observations and a report under `benchmarks/`, with workloads for
@@ -266,7 +285,7 @@ the upcoming fixed-batch, continuous-batch, prefix-reuse, and paging milestones.
 The smaller command below remains useful for inspecting one inference loop.
 
 ```bash
-uv run python infer.py "Count from 1 to 100, separated by commas." \
+uv run python -m mlx_nano_llm.infer "Count from 1 to 100, separated by commas." \
   --max-tokens 128 --benchmark
 ```
 
@@ -296,7 +315,7 @@ This is a small local measurement; repeated runs can vary.
 
 ## Read the loop
 
-Start with `encode_prompt()` and `generate_tokens()` in `infer.py`:
+Start with `encode_prompt()` and `generate_tokens()` in `mlx_nano_llm/infer.py`:
 
 1. `AutoTokenizer` applies Qwen's chat template and encodes the text, following
    nano-vllm's tokenizer flow. Thinking is disabled for this greedy exercise.
@@ -305,7 +324,7 @@ Start with `encode_prompt()` and `generate_tokens()` in `infer.py`:
 4. **Decode:** pass just that new token, reusing the cache. Stop at EOS or the
    token budget. Decode the collected output IDs into text.
 
-`sampler.py` defines the `Sampler` abstract base class and `GreedySampler`.
+`mlx_nano_llm/sampler.py` defines the `Sampler` abstract base class and `GreedySampler`.
 Its `sample()` method receives `[batch, vocabulary]` logits and returns an
 integer MLX array of shape `[batch]` containing the selected token IDs.
 `generate_tokens()` creates a fresh `GreedySampler` by default. To change token

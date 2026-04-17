@@ -6,29 +6,29 @@ from unittest.mock import MagicMock, patch
 
 from mlx_lm.models.qwen3 import Model
 
-from engine import InferenceEngine
-from sampler import GreedySampler
-from test_batch_infer import ScriptedModel
+from mlx_nano_llm.engine import InferenceEngine
+from mlx_nano_llm.sampler import GreedySampler
+from tests.test_batch_infer import ScriptedModel
 
 
 class InferenceEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.loader: MagicMock = self.enterContext(
             patch(
-                "engine.load_model",
+                "mlx_nano_llm.engine.load_model",
                 return_value=(object(), {"eos_token_id": 9, "max_position_embeddings": 16}),
             )
         )
         self.tokenizer_loader: MagicMock = self.enterContext(
-            patch("engine.AutoTokenizer.from_pretrained")
+            patch("mlx_nano_llm.engine.AutoTokenizer.from_pretrained")
         )
         self.tokenizer_loader.return_value.eos_token_id = 9
         self.tokenizer_loader.return_value.decode.return_value = "decoded response"
         self.encoder: MagicMock = self.enterContext(
-            patch("engine.encode_prompt", return_value=[1, 2])
+            patch("mlx_nano_llm.engine.encode_prompt", return_value=[1, 2])
         )
         self.generator: MagicMock = self.enterContext(
-            patch("engine.generate_tokens", return_value=[3])
+            patch("mlx_nano_llm.engine.generate_tokens", return_value=[3])
         )
         self.engine: InferenceEngine = InferenceEngine(collect_stats=True)
 
@@ -113,7 +113,7 @@ class InferenceEngineTests(unittest.TestCase):
         self.tokenizer_loader.return_value.pad_token_id = 0
         for prompt, budget in [("first", 1), ("second", 2), ("third", 3)]:
             self.engine.add_request(prompt, budget)
-        with patch("engine.generate_batch_tokens", return_value=[[4], [5, 6]]) as generate:
+        with patch("mlx_nano_llm.engine.generate_batch_tokens", return_value=[[4], [5, 6]]) as generate:
             outputs = self.engine.run_batch(2)
             self.assertEqual([out.prompt for out in outputs], ["first", "second"])
             self.assertEqual([out.token_ids for out in outputs], [[4], [5, 6]])
@@ -126,7 +126,7 @@ class InferenceEngineTests(unittest.TestCase):
         self.engine.collect_stats = False
         for prompt in ["a", "b", "c"]:
             self.engine.add_request(prompt, 1)
-        with patch("engine.generate_batch_tokens", side_effect=RuntimeError("batch failed")):
+        with patch("mlx_nano_llm.engine.generate_batch_tokens", side_effect=RuntimeError("batch failed")):
             with self.assertRaisesRegex(RuntimeError, "batch failed"):
                 self.engine.run_batch(2)
         self.assertEqual(self.engine.pending_requests, 1)

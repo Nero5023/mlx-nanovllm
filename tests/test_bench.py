@@ -4,11 +4,11 @@ import asyncio
 import unittest
 from time import perf_counter
 
-from bench import run_case
-from bench_metrics import Observation, distribution, intervals_ms, summarize
-from bench_workloads import Case, RequestSpec, common_prefix_tokens
-from request import RequestOutput
-from telemetry import MemorySnapshot, RequestTiming, TokenCallback, TokenEvent
+from mlx_nano_llm.benchmarks.runner import run_case
+from mlx_nano_llm.benchmarks.metrics import Observation, distribution, intervals_ms, summarize
+from mlx_nano_llm.benchmarks.workloads import Case, RequestSpec, common_prefix_tokens
+from mlx_nano_llm.request import RequestOutput
+from mlx_nano_llm.telemetry import MemorySnapshot, RequestTiming, TokenCallback, TokenEvent
 
 
 class MetricTests(unittest.TestCase):

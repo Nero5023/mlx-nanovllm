@@ -3,8 +3,8 @@
 import asyncio
 from time import perf_counter
 
-from client import InferenceClient
-from request import RequestOutput
+from mlx_nano_llm.client import InferenceClient
+from mlx_nano_llm.request import RequestOutput
 
 
 async def main() -> None:

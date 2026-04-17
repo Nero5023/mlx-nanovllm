@@ -5,11 +5,11 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
-from infer import DEFAULT_MODEL
-from request import RequestOutput
-from sampler import Sampler
-from telemetry import MemorySnapshot, TokenCallback, TokenEvent
-from worker import InferenceWorker
+from mlx_nano_llm.infer import DEFAULT_MODEL
+from mlx_nano_llm.request import RequestOutput
+from mlx_nano_llm.sampler import Sampler
+from mlx_nano_llm.telemetry import MemorySnapshot, TokenCallback, TokenEvent
+from mlx_nano_llm.worker import InferenceWorker
 
 
 class InferenceClient:

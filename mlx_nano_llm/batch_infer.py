@@ -9,9 +9,9 @@ import mlx.core as mx
 from mlx_lm.models.cache import BatchKVCache
 from mlx_lm.models.qwen3 import Model as Qwen3Model
 
-from request import Request
-from sampler import GreedySampler
-from telemetry import TokenEvent
+from mlx_nano_llm.request import Request
+from mlx_nano_llm.sampler import GreedySampler
+from mlx_nano_llm.telemetry import TokenEvent
 
 
 @dataclass

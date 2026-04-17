@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from statistics import mean
 
-from telemetry import RequestTiming
+from mlx_nano_llm.telemetry import RequestTiming
 
 
 @dataclass

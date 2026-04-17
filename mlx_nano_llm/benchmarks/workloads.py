@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from transformers import PreTrainedTokenizerBase
 
-from infer import encode_prompt
+from mlx_nano_llm.infer import encode_prompt
 
 
 @dataclass(frozen=True)
