@@ -1,0 +1,51 @@
+{
+  "model": "Qwen3-0.6B-4bit",
+  "workload": "context-burst: four 2048-token prompts, 32 output tokens each, ignore_eos=True",
+  "baseline_peak_bytes": 4435346432,
+  "optimized_peak_bytes": 1996358656,
+  "peak_reduction_percent": 54.98979196761873,
+  "prefill_logits": {
+    "dtype": "mlx.core.bfloat16",
+    "shape": [
+      4,
+      151936
+    ],
+    "max_abs_logit_difference": 0.125,
+    "mean_abs_logit_difference": 0.006734574679285288,
+    "first_token_argmax_equal": true
+  },
+  "generation": [
+    {
+      "request": "request-0",
+      "tokens": 32,
+      "exact_match": true
+    },
+    {
+      "request": "request-1",
+      "tokens": 32,
+      "exact_match": true
+    },
+    {
+      "request": "request-2",
+      "tokens": 32,
+      "exact_match": true
+    },
+    {
+      "request": "request-3",
+      "tokens": 32,
+      "exact_match": true
+    }
+  ],
+  "preflight_checks": {
+    "cached_equals_full_recompute": true,
+    "a_b_a_cache_isolation": true,
+    "zero_output_budget": true,
+    "one_output_budget": true,
+    "fixed_batch_equals_serial": true,
+    "reordered_batch_equals_serial": true,
+    "partial_batch_equals_serial": true,
+    "continuous_refill_equals_serial": true,
+    "newcomer_completes_before_long_request": true
+  },
+  "test_count": 42
+}

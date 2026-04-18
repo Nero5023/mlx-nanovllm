@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import cast
 
 from mlx_lm.models.qwen3 import Model as Qwen3Model
-from mlx_lm.utils import load_model
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from mlx_nano_llm.benchmark import BenchmarkStats
 from mlx_nano_llm.batch_infer import ActiveRequest, BatchState, generate_batch_tokens
 from mlx_nano_llm.infer import DEFAULT_MODEL, encode_prompt, generate_tokens
+from mlx_nano_llm.model import load_model
 from mlx_nano_llm.request import Request, RequestOutput
 from mlx_nano_llm.sampler import GreedySampler, Sampler
 from mlx_nano_llm.telemetry import TokenCallback

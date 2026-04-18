@@ -28,6 +28,11 @@ Run commands from the repository root with `uv run python -m ...`.
 Run all tests with `uv run python -m unittest discover -v`.
 The [v0.4 report](reports/v0.4/README.md) compares serial and continuous serving.
 
+The current follow-up uses a local Qwen3 model that projects only the final
+hidden position to vocabulary logits. All prompt positions still pass through
+the transformer and populate KV. The [targeted validation](reports/last-token-projection/README.md)
+records peak memory, logits differences and complete output comparisons.
+
 ## Continuous batching
 
 The [v0.3 fixed-batching archive](reports/fixed-batching/README.md) records
@@ -331,7 +336,7 @@ integer MLX array of shape `[batch]` containing the selected token IDs.
 selection, subclass `Sampler`, implement `sample()`, and pass an instance such
 as `sampler=MySampler()`; the generation loop and cache handling stay the same.
 
-`--trace` shows `[batch, input length]`, `[batch, input length, vocabulary]`,
+`--trace` shows `[batch, input length]`, `[batch, 1, vocabulary]`,
 the number of tokens cached per layer, and the selected token ID. The selected
 token enters the cache on the *following* forward pass.
 

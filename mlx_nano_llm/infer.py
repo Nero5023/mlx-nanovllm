@@ -10,10 +10,10 @@ from typing import cast
 import mlx.core as mx
 from mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_lm.models.qwen3 import Model as Qwen3Model
-from mlx_lm.utils import load_model
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from mlx_nano_llm.benchmark import BenchmarkStats
+from mlx_nano_llm.model import load_model
 from mlx_nano_llm.sampler import GreedySampler, Sampler
 from mlx_nano_llm.telemetry import TokenCallback, TokenEvent
 
@@ -73,7 +73,7 @@ def generate_tokens(
 
     for step in range(max_tokens):
         step_start: float = perf_counter() if stats is not None else 0.0
-        logits: mx.array = model(inputs, cache=cache)  # [1, sequence, vocabulary]
+        logits: mx.array = model(inputs, cache=cache)  # LastTokenQwen3 returns [1, 1, vocabulary].
         next_token: mx.array = sampler.sample(logits[:, -1, :])
         # Reading the selected token ID evaluates MLX's lazy graph.
         token_id: int = cast(int, next_token.item())
