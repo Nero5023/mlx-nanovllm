@@ -49,6 +49,7 @@ class InferenceEngine:
         self._waiting: deque[Request] = deque()
         self._next_request_id: int = 0
         self._batch: BatchState | None = None
+        self._prefill_batch: BatchState | None = None
 
     @property
     def pending_requests(self) -> int:
@@ -57,6 +58,10 @@ class InferenceEngine:
     @property
     def active_requests(self) -> int:
         return self._batch.size if self._batch is not None else 0
+
+    @property
+    def prefilling_requests(self) -> int:
+        return self._prefill_batch.size if self._prefill_batch is not None else 0
 
     def add_request(
         self,
@@ -157,38 +162,52 @@ class InferenceEngine:
             token_ids=token_ids, stats=None, prompt_tokens=len(request.prompt_token_ids),
         ) for request, token_ids in zip(requests, batches, strict=True)]
 
-    def prefill_next(self, max_requests: int) -> list[RequestOutput]:
-        """Prefill queued requests separately, then merge survivors into decode.
+    def prefill_next(
+        self, max_requests: int, *, chunk_size: int | None = None,
+    ) -> list[RequestOutput]:
+        """Advance one incoming group by a chunk, then merge only when prefill completes.
 
-        The worker limits admission to available slots. A complete prefill blocks
-        existing decode work; chunking that prefill is a later optimization.
-        Zero-budget and one-token/EOS requests can finish at admission.
+        chunk_size limits padded prompt positions per row, not total batch tokens.
+        None processes the whole remaining prompt. An existing prefill group is
+        advanced before any more waiting requests are consumed.
         """
         if max_requests < 1:
             raise ValueError("max_requests must be positive.")
         if not self.use_cache or self.collect_stats:
             raise ValueError("Batching requires use_cache=True and collect_stats=False.")
-        count = min(max_requests, len(self._waiting))
-        states: list[ActiveRequest] = []
-        for _ in range(count):
-            request = self._waiting.popleft()
-            states.append(ActiveRequest(request))
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        finished: list[ActiveRequest] = []
+        if self._prefill_batch is None:
+            count = min(max_requests, len(self._waiting))
+            states: list[ActiveRequest] = []
+            for _ in range(count):
+                request = self._waiting.popleft()
+                states.append(ActiveRequest(request))
 
-        finished: list[ActiveRequest] = [state for state in states if state.request.max_tokens == 0]
-        active: list[ActiveRequest] = [state for state in states if state.request.max_tokens > 0]
-
-        if active:
-            pad_token_id: int | None = cast(int | None, self.tokenizer.pad_token_id)
-            incoming: BatchState = BatchState(
-                self.model, active, self.eos_token_ids,
-                pad_token_id=pad_token_id if pad_token_id is not None else 0, trace=self.trace,
-            )
-            finished.extend(incoming.step())
-            if incoming.size:
-                if self._batch is None:
-                    self._batch = incoming
+            active: list[ActiveRequest] = []
+            for state in states:
+                if state.request.max_tokens == 0:
+                    finished.append(state)
                 else:
-                    self._batch.extend(incoming)
+                    active.append(state)
+            if active:
+                pad_token_id: int | None = cast(int | None, self.tokenizer.pad_token_id)
+                self._prefill_batch = BatchState(
+                    self.model, active, self.eos_token_ids,
+                    pad_token_id=pad_token_id if pad_token_id is not None else 0, trace=self.trace,
+                )
+
+        incoming = self._prefill_batch
+        if incoming is not None:
+            finished.extend(incoming.step() if chunk_size is None else incoming.prefill_chunk(chunk_size))
+            if not incoming.prefilling:
+                self._prefill_batch = None
+                if incoming.size:
+                    if self._batch is None:
+                        self._batch = incoming
+                    else:
+                        self._batch.extend(incoming)
         return [self._output(state) for state in finished]
 
     def step(self) -> list[RequestOutput]:
@@ -203,6 +222,7 @@ class InferenceEngine:
     def abort_batch(self) -> None:
         """Discard active state after a shared inference failure."""
         self._batch = None
+        self._prefill_batch = None
 
     def _output(self, state: ActiveRequest) -> RequestOutput:
         return RequestOutput(

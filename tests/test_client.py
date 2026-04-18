@@ -69,7 +69,11 @@ class FakeEngine:
     def active_requests(self) -> int:
         return len(self.active)
 
-    def prefill_next(self, max_batch_size: int) -> list[RequestOutput]:
+    @property
+    def prefilling_requests(self) -> int:
+        return 0
+
+    def prefill_next(self, max_batch_size: int, *, chunk_size: int | None = None) -> list[RequestOutput]:
         self.state.thread_ids.append(threading.get_ident())
         selected = self.waiting[:max_batch_size]
         del self.waiting[:max_batch_size]
@@ -125,6 +129,46 @@ class FakeEngine:
         return RequestOutput(item.request_id, item.prompt, f"answer:{item.prompt}", [item.request_id], None)
 
 
+class ChunkedFakeEngine(FakeEngine):
+    """Three resumable prefill chunks for incoming prompts; one for ordinary prompts."""
+
+    def __init__(self, state: EngineState, events: list[str]) -> None:
+        super().__init__(state)
+        self.events = events
+        self.incoming: list[FakeRequest] = []
+        self.remaining = 0
+
+    @property
+    def prefilling_requests(self) -> int:
+        return len(self.incoming)
+
+    def prefill_next(self, max_batch_size: int, *, chunk_size: int | None = None) -> list[RequestOutput]:
+        if not self.incoming:
+            self.incoming = self.waiting[:max_batch_size]
+            del self.waiting[:max_batch_size]
+            self.remaining = 3 if any(r.prompt.startswith('incoming') for r in self.incoming) else 1
+            for item in self.incoming:
+                self._start(item)
+        self.events.append(f'prefill:{self.incoming[0].prompt}:{self.remaining}')
+        if self.remaining == 2 and self.incoming[0].prompt == 'incoming-error':
+            raise RuntimeError('chunk failed')
+        self.remaining -= 1
+        if self.remaining:
+            return []
+        finished, surviving = self._advance(self.incoming)
+        self.incoming = []
+        self.active.extend(surviving)
+        return finished
+
+    def step(self) -> list[RequestOutput]:
+        self.events.append('decode')
+        return super().step()
+
+    def abort_batch(self) -> None:
+        super().abort_batch()
+        self.incoming.clear()
+
+
 class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.state: EngineState = EngineState()
@@ -140,6 +184,58 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def wait_for_event(self, event: threading.Event) -> None:
         self.assertTrue(await asyncio.to_thread(event.wait, 2))
+
+    async def test_chunked_prefill_yields_to_decode_between_chunks(self) -> None:
+        events: list[str] = []
+        self.factory.side_effect = lambda *a, **kw: ChunkedFakeEngine(self.state, events)
+        self.state.block_decode_at = 1
+        async with InferenceClient(max_batch_size=2, prefill_chunk_size=2) as client:
+            long = client.submit('long', 12)
+            try:
+                await self.wait_for_event(self.state.decoding)
+                incoming = client.submit('incoming', 2)
+            finally:
+                self.state.decode_release.set()
+            await asyncio.wait_for(asyncio.gather(long, incoming), 2)
+        positions = [i for i, event in enumerate(events) if event.startswith('prefill:incoming:')]
+        self.assertEqual(len(positions), 3)
+        for a, b in zip(positions, positions[1:]):
+            self.assertIn('decode', events[a + 1:b])
+        self.assertTrue(all(len(rows) <= 2 for rows in self.state.decode_batches))
+
+    async def test_middle_chunk_failure_fails_both_groups_and_recovers(self) -> None:
+        events: list[str] = []
+        self.factory.side_effect = lambda *a, **kw: ChunkedFakeEngine(self.state, events)
+        self.state.block_decode_at = 1
+        async with InferenceClient(max_batch_size=2, prefill_chunk_size=2) as client:
+            long = client.submit('long', 12)
+            try:
+                await self.wait_for_event(self.state.decoding)
+                incoming = client.submit('incoming-error', 2)
+            finally:
+                self.state.decode_release.set()
+            for future in (long, incoming):
+                with self.assertRaisesRegex(RuntimeError, 'chunk failed'):
+                    await asyncio.wait_for(future, 2)
+            recovered = await asyncio.wait_for(client.generate('recovered', 2), 2)
+            self.assertEqual(recovered.prompt, 'recovered')
+
+    async def test_shutdown_drains_chunked_prefill_even_without_decode_rows(self) -> None:
+        events: list[str] = []
+        self.factory.side_effect = lambda *a, **kw: ChunkedFakeEngine(self.state, events)
+        client = InferenceClient(max_batch_size=1, prefill_chunk_size=2)
+        await client.start()
+        future = client.submit('incoming', 3)
+        await asyncio.wait_for(client.close(), 2)
+        self.assertEqual(len((await future).token_ids), 3)
+        self.assertEqual(sum(e.startswith('prefill:incoming:') for e in events), 3)
+        self.assertFalse(client._worker._thread.is_alive())
+
+    async def test_chunked_prefill_options_are_validated_before_start(self) -> None:
+        for chunk, cache, stats in ((0, True, False), (-1, True, False),
+                                    (2, False, False), (2, True, True)):
+            with self.subTest(chunk=chunk, cache=cache, stats=stats), self.assertRaises(ValueError):
+                InferenceClient(prefill_chunk_size=chunk, use_cache=cache, collect_stats=stats)
 
     async def test_submissions_while_busy_fifo_and_thread_ownership(self) -> None:
         async with InferenceClient() as client:

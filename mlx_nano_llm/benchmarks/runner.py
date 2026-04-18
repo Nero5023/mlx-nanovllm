@@ -108,11 +108,12 @@ async def run_case(backend: BenchmarkBackend, case: Case, repeat: int) -> CaseRu
 
 async def check_correctness(
     model_path: Path, max_batch_size: int = 1, batch_wait_ms: float = 2.0,
+    prefill_chunk_size: int | None = None,
 ) -> dict[str, object]:
     """Greedy equivalence and request-cache isolation, outside performance timing."""
     prompts: list[str] = ["What is the capital of France?", "What is 2 + 2?"]
     cached: list[list[int]] = []
-    async with InferenceClient(model_path) as client:
+    async with InferenceClient(model_path, prefill_chunk_size=prefill_chunk_size) as client:
         for prompt in prompts:
             cached.append((await client.generate(prompt, 24)).token_ids)
         repeated: list[int] = (await client.generate(prompts[0], 24)).token_ids
@@ -139,6 +140,7 @@ async def check_correctness(
                 reference.append((await client.generate(prompt, budget)).token_ids)
         async with InferenceClient(
             model_path, max_batch_size=max_batch_size, batch_wait_ms=batch_wait_ms,
+            prefill_chunk_size=prefill_chunk_size,
         ) as client:
             batch_outputs: list[RequestOutput] = await asyncio.gather(*(
                 client.generate(prompt, budget) for prompt, budget in zip(mixed_prompts, budgets)
@@ -203,6 +205,7 @@ def command_output(arguments: list[str]) -> str | None:
 
 def metadata(
     model_path: Path, use_cache: bool, max_batch_size: int = 1, batch_wait_ms: float = 2.0,
+    prefill_chunk_size: int | None = None,
 ) -> dict[str, object]:
     source_root = Path(__file__).resolve().parents[2]
     source_hashes: dict[str, str] = {
@@ -225,11 +228,16 @@ def metadata(
             for path in sorted(model_path.iterdir())
             if path.suffix in {".json", ".safetensors"}
         },
-        "backend": "continuous-batch-worker" if max_batch_size > 1 else "fifo-worker",
+        "backend": ("chunked-prefill-worker" if prefill_chunk_size is not None
+                    else "continuous-batch-worker" if max_batch_size > 1 else "fifo-worker"),
         "batch_compaction": max_batch_size > 1,
         "continuous_batching": max_batch_size > 1,
         "batch_size_scope": "Newly admitted group size; decode can merge survivors from several groups.",
-        "prefill_policy": "Whole incoming group; active decode pauses during prefill; no chunking.",
+        "prefill_chunk_size": prefill_chunk_size,
+        "prefill_policy": (
+            "One incoming group; at most chunk_size padded positions per row, then one decode step."
+            if prefill_chunk_size is not None else "Whole incoming group; active decode pauses during prefill."
+        ),
         "max_active_requests": max_batch_size,
         "batch_wait_ms": batch_wait_ms if max_batch_size > 1 else 0.0,
         "use_kv_cache": use_cache, "prefix_reuse": False, "paged_kv": False,
@@ -265,7 +273,8 @@ def write_report(
         f"# {info['backend']} benchmark", "",
         f"Correctness: **{'PASS' if correctness.get('passed') else 'FAIL'}**. "
         f"Chip: {info['chip']}. Max active requests: {info['max_active_requests']}, "
-        f"batch wait: {info['batch_wait_ms']} ms, KV cache={info['use_kv_cache']}.", "",
+        f"batch wait: {info['batch_wait_ms']} ms, KV cache={info['use_kv_cache']}, "
+        f"prefill chunk size={info['prefill_chunk_size']} (None means whole prompt).", "",
         "TTFT includes queueing and client notification. ITL pools consecutive token gaps; "
         "TPOT averages gaps per request. Values are milliseconds. Throughput is the median "
         "of per-repeat output tokens / total workload wall time; memory is the maximum across repeats.", "",
@@ -334,11 +343,15 @@ async def main_async(args: argparse.Namespace) -> None:
         if unknown:
             raise ValueError(f"Unknown cases for this profile: {sorted(unknown)}")
         cases = [case for case in cases if case.name in args.case]
-    info: dict[str, object] = metadata(args.model, not args.no_cache, args.batch_size, args.batch_wait_ms)
+    info: dict[str, object] = metadata(
+        args.model, not args.no_cache, args.batch_size, args.batch_wait_ms, args.prefill_chunk_size,
+    )
     info["profile"] = args.profile
     info["repeats"] = args.repeats
     print("Checking cache equivalence, request isolation, and selected backend...", flush=True)
-    correctness: dict[str, object] = await check_correctness(args.model, args.batch_size, args.batch_wait_ms)
+    correctness: dict[str, object] = await check_correctness(
+        args.model, args.batch_size, args.batch_wait_ms, args.prefill_chunk_size,
+    )
     runs: list[CaseRun] = []
     write_report(args.output, info, cases, correctness, runs)
     if not correctness["passed"]:
@@ -351,6 +364,7 @@ async def main_async(args: argparse.Namespace) -> None:
             async with InferenceClient(
                 args.model, use_cache=not args.no_cache,
                 max_batch_size=args.batch_size, batch_wait_ms=args.batch_wait_ms,
+                prefill_chunk_size=args.prefill_chunk_size,
             ) as client:
                 await client.generate(warmup.prompt, warmup.max_tokens, ignore_eos=True)
                 run: CaseRun = await run_case(client, case, repeat)
@@ -379,6 +393,7 @@ def main() -> None:
     parser.add_argument("--max-concurrency", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=1, help="Max active rows with continuous refill. 1 keeps serial execution.")
     parser.add_argument("--batch-wait-ms", type=float, default=2.0, help="Max collection wait when idle; active decode never waits to fill slots.")
+    parser.add_argument("--prefill-chunk-size", type=int, help="Max padded prompt positions per row per scheduler iteration. Default: whole prefill.")
     parser.add_argument("--no-cache", action="store_true", help="Full-prefix recomputation ablation.")
     parser.add_argument("--output", type=Path, default=Path("benchmarks") / f"suite-{uuid4().hex[:12]}")
     args: argparse.Namespace = parser.parse_args()
@@ -386,8 +401,10 @@ def main() -> None:
         parser.error("repeats/concurrency must be >= 1; max-prompt-tokens must be >= 128")
     if args.batch_size < 1 or not isfinite(args.batch_wait_ms) or args.batch_wait_ms < 0:
         parser.error("batch-size must be >= 1; batch-wait-ms must be finite and >= 0")
-    if args.batch_size > 1 and args.no_cache:
-        parser.error("Batching requires KV caching; --no-cache only supports batch-size=1")
+    if args.prefill_chunk_size is not None and args.prefill_chunk_size < 1:
+        parser.error("prefill-chunk-size must be >= 1")
+    if (args.batch_size > 1 or args.prefill_chunk_size is not None) and args.no_cache:
+        parser.error("Batching and chunked prefill require KV caching")
     if (args.output / "results.json").exists():
         parser.error("Output already contains results.json; choose a new directory.")
     asyncio.run(main_async(args))

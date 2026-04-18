@@ -54,14 +54,18 @@ class InferenceWorker:
         collect_stats: bool = False,
         max_batch_size: int = 1,
         batch_wait_ms: float = 2.0,
+        prefill_chunk_size: int | None = None,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be positive.")
         if not isfinite(batch_wait_ms) or batch_wait_ms < 0:
             raise ValueError("batch_wait_ms must be finite and nonnegative.")
-        if max_batch_size > 1 and (not use_cache or collect_stats):
+        if prefill_chunk_size is not None and prefill_chunk_size < 1:
+            raise ValueError("prefill_chunk_size must be positive.")
+        if (max_batch_size > 1 or prefill_chunk_size is not None) and (not use_cache or collect_stats):
             raise ValueError("Batching requires use_cache=True and collect_stats=False.")
         self._max_batch_size: int = max_batch_size
+        self._prefill_chunk_size = prefill_chunk_size
         self._batch_wait_seconds: float = batch_wait_ms / 1000
         self._queue: Queue[_WorkItem | _MemoryProbe | None] = Queue()
         # Accessed only by the worker thread after initialization.
@@ -157,7 +161,7 @@ class InferenceWorker:
             return
         self._ready.set_result(None)
 
-        if self._max_batch_size > 1:
+        if self._max_batch_size > 1 or self._prefill_chunk_size is not None:
             self._run_continuous(engine)
             return
         deferred: deque[_MemoryProbe | None] = deque()
@@ -171,17 +175,21 @@ class InferenceWorker:
                 items: list[_WorkItem] | None = self._next_batch(deferred)
                 if items is None:
                     return
+            elif engine.prefilling_requests:
+                # Finish the current incoming group before admitting another.
+                items = []
             else:
                 # Never wait to fill slots while existing requests need decode.
                 items = self._take_ready(deferred, self._max_batch_size - len(self._running))
             admitted: int = self._admit_requests(engine, items)
             try:
-                if admitted:
-                    # Do prefil here, but not very ideal, other requests need to wait this to be refilled first.
-                    self._deliver_results(engine.prefill_next(admitted))
+                if admitted or engine.prefilling_requests:
+                    self._deliver_results(engine.prefill_next(
+                        self._max_batch_size, chunk_size=self._prefill_chunk_size,
+                    ))
                 if engine.active_requests:
                     self._deliver_results(engine.step())
-                if len(self._running) != engine.active_requests:
+                if len(self._running) != engine.active_requests + engine.prefilling_requests:
                     raise RuntimeError("Active rows and outstanding request results disagree.")
             except BaseException as error:
                 # A prefill/decode/merge failure invalidates the shared active batch.

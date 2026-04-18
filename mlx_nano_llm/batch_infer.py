@@ -50,6 +50,30 @@ class BatchState:
     def size(self) -> int:
         return len(self.active)
 
+    @property
+    def prefilling(self) -> bool:
+        return self._prefill
+
+    def prefill_chunk(self, chunk_size: int) -> list[ActiveRequest]:
+        """Consume at most chunk_size prompt positions per row, sampling only at the end."""
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        if not self._prefill:
+            raise ValueError("This batch has already completed prefill.")
+        if self.inputs.shape[1] <= chunk_size:
+            return self.step()
+
+        chunk = self.inputs[:, :chunk_size]
+        # Intermediate chunks need only KV updates, not vocabulary logits.
+        self.model.model(chunk, cache=self.cache)
+        # MLX is lazy: finish this chunk before yielding to the decode batch.
+        mx.eval([cache.state for cache in self.cache])
+        self.inputs = self.inputs[:, chunk_size:]
+        if self.trace:
+            print(f"prefill-chunk batch={self.size} input={chunk.shape} "
+                  f"remaining={self.inputs.shape[1]}", file=sys.stderr)
+        return []
+
     def step(self) -> list[ActiveRequest]:
         """Run one forward pass and return the requests that just completed."""
         if not self.active:

@@ -94,6 +94,10 @@ def build_cases(
             request(128, 128 if index == 0 else 16, index, delay=index * 0.05)
             for index in range(count)
         ]),
+        Case("prefill-interference", "A long arriving prompt interrupts an existing decode; compare token gaps.", [
+            request(128, 128, 0),
+            request(max_prompt_tokens, 16, 1, delay=0.25),
+        ]),
         Case("prefix-shared", "Closed-loop: cold first request, then a reusable prefix.", [
             request(512, 32, index, shared=True) for index in range(4)
         ], sequential=True),

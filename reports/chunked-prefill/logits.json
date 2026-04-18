@@ -1,0 +1,27 @@
+{
+  "prompt_lengths": [
+    2048,
+    128,
+    512
+  ],
+  "chunk_size": 256,
+  "dtype": "mlx.core.bfloat16",
+  "max_abs_logit_difference": 0.0,
+  "mean_abs_logit_difference": 0.0,
+  "first_token_argmax_match_by_row": [
+    true,
+    true,
+    true
+  ],
+  "offsets": [
+    2048,
+    128,
+    512
+  ],
+  "padding": [
+    0,
+    1920,
+    1536
+  ],
+  "logits_and_valid_kv_finite": true
+}

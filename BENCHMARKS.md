@@ -3,8 +3,9 @@
 This suite measures the async client → worker path on the local Qwen model.
 The default is **one active request**; `--batch-size N` enables up to N active rows.
 Finished rows compact during decode, and queued requests refill available slots.
-New requests prefill separately before their KV joins active decode. There is no
-chunked prefill, cross-request prefix reuse, or paged KV cache.
+New requests prefill separately before their KV joins active decode. Optional
+chunked prefill lets existing rows decode between chunks. There is no
+cross-request prefix reuse or paged KV cache.
 Workloads stay separate from scheduling so the same requests compare each stage.
 
 ```bash
@@ -13,6 +14,11 @@ uv run python -m mlx_nano_llm.benchmarks.runner --output benchmarks/fifo-baselin
 
 # Same workloads, up to four active rows. Idle collection wait: 2 ms.
 uv run python -m mlx_nano_llm.benchmarks.runner --batch-size 4 --output benchmarks/continuous-batch-4
+
+# Limit prefill interruptions; compare with the same command without the chunk flag.
+uv run python -m mlx_nano_llm.benchmarks.runner --batch-size 4 --prefill-chunk-size 256 \
+  --case prefill-interference --case context-burst --repeats 3 \
+  --output benchmarks/chunked-prefill-256
 
 # Add adjacent-length cases for allocation/kernel changes.
 uv run python -m mlx_nano_llm.benchmarks.runner --profile full --repeats 3 \
@@ -24,7 +30,7 @@ uv run python -m mlx_nano_llm.benchmarks.runner --case burst-1 --case burst-4
 uv run python -m mlx_nano_llm.benchmarks.runner --max-concurrency 8 --max-prompt-tokens 4096
 uv run python -m mlx_nano_llm.benchmarks.runner --case single --no-cache
 
-uv run python -m unittest -v tests.test_engine tests.test_client tests.test_bench tests.test_batch_infer
+uv run python -m unittest discover -v
 ```
 
 Output directories contain `summary.md` and `results.json`. Existing results
@@ -70,6 +76,13 @@ The report records both client concurrency and **admission group sizes**.
 `--batch-wait-ms` bounds collection only when idle (default 2 ms) and contributes
 to queue time. Active decode never waits to fill slots. Incoming groups prefill
 separately, temporarily pausing existing decode; this can produce ITL spikes.
+`--prefill-chunk-size N` limits each incoming row to N padded prompt positions
+per iteration, followed by one decode step. Only one incoming group prefills at
+a time, and its rows reserve batch slots. Intermediate chunks generate no output
+tokens. Metadata records the chunk size and policy. The `prefill-interference`
+case submits a 2048-token prompt (or `--max-prompt-tokens`) 250 ms after a
+128-token prompt begins a 128-token generation; inspect request-0 token gaps
+and request-1 TTFT to assess responsiveness and admission cost separately.
 Completed requests return individually, and later arrivals fill free slots.
 `timing.batch_size` (and the legacy JSON name `actual_batch_sizes`) counts newly
 admitted requests together, including any zero-budget requests. It is not each

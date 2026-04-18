@@ -76,8 +76,25 @@ Start reading [worker.py](mlx_nano_llm/worker.py), `_run_continuous()`. Each ite
    rows, and deliver their results immediately. Then checks for new work again.
 
 `engine.add_request()` handles tokenization and validation before prefill.
-Prefill is a whole forward pass on the same worker, so it pauses existing decode.
-This first implementation has no chunked prefill, prefix reuse, or paged KV.
+By default prefill is a whole forward pass on the same worker, pausing decode.
+Set `prefill_chunk_size=256` to process at most 256 padded prompt positions per
+row, then give existing decode rows one step before the next chunk:
+
+```python
+async with InferenceClient(max_batch_size=4, prefill_chunk_size=256) as client:
+    ...
+```
+
+Intermediate chunks update and evaluate KV without projecting vocabulary logits
+or emitting tokens. The final chunk samples the first output token and merges
+survivors into decode. The first version keeps one incoming group at a time;
+another group is admitted only after its prefill completes. Prefilling requests
+reserve capacity alongside decode rows. The limit is per row, not a total token
+budget across the group. Smaller chunks trade more model calls and possibly
+longer incoming-request TTFT for shorter interruptions of existing decode.
+The option requires `use_cache=True` and `collect_stats=False`; `None` keeps the
+whole-prompt baseline. Prefix reuse and paged KV are not implemented.
+See the [chunked-prefill validation](reports/chunked-prefill/README.md).
 Every iteration advances existing requests even if incoming short requests keep
 arriving; the scheduler does not continually prefill without decoding.
 
@@ -128,7 +145,7 @@ memory and compute, so similar prompt/output lengths are the simplest first
 comparison. Slot refill is implemented; prefix sharing is not.
 
 ```bash
-uv run python -m unittest -v tests.test_engine tests.test_client tests.test_bench tests.test_batch_infer
+uv run python -m unittest discover -v
 ```
 
 The tests cover partial batches, failure/cancellation/shutdown, independent
