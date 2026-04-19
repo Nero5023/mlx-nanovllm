@@ -43,7 +43,7 @@ class RecordingModel:
 class ChunkedPrefillTests(unittest.TestCase):
     def test_padding_only_chunks_preserve_cache_and_complete_outputs(self) -> None:
         model = tiny_model()
-        for chunk_size in (1, 2, 3, 7, 10):
+        for chunk_size in (None, 1, 2, 3, 7, 10):
             with self.subTest(chunk_size=chunk_size):
                 events = []
                 requests = [
@@ -55,18 +55,19 @@ class ChunkedPrefillTests(unittest.TestCase):
                 expected = generate_batch_tokens(model, requests, set())
                 events.clear()
                 whole = BatchState(model, [ActiveRequest(r) for r in requests], set())
-                whole.step()
+                whole.prefill()
                 events.clear()
                 recorded = RecordingModel(model)
                 states = [ActiveRequest(r) for r in requests]
                 batch = BatchState(cast(Model, recorded), states, set())
                 while batch.prefilling:
-                    finished = batch.prefill_chunk(chunk_size)
+                    finished = batch.prefill(chunk_size)
                     self.assertEqual(finished, [])
                     if batch.prefilling:
                         self.assertEqual(events, [])
                 self.assertEqual(len(events), 3)  # Only the final chunk samples/emits.
-                self.assertTrue(all(width <= chunk_size for _, width in recorded.calls))
+                limit = chunk_size if chunk_size is not None else 7
+                self.assertTrue(all(width <= limit for _, width in recorded.calls))
                 self.assertEqual(sum(kind == "head" for kind, _ in recorded.calls), 1)
                 for a, b in zip(batch.cache, whole.cache, strict=True):
                     self.assertEqual(a.offset.tolist(), [7, 1, 3])
@@ -78,6 +79,22 @@ class ChunkedPrefillTests(unittest.TestCase):
                 while batch.size:
                     batch.step()
                 self.assertEqual([s.token_ids for s in states], expected)
+
+    def test_partial_prefill_can_finish_without_chunk_limit(self) -> None:
+        model = tiny_model()
+        recorded = RecordingModel(model)
+        request = Request(0, 'prompt', [1, 2, 3, 4, 5, 6, 7], 8, GreedySampler())
+        state = ActiveRequest(request)
+        batch = BatchState(cast(Model, recorded), [state], set())
+        self.assertEqual(batch.prefill(2), [])
+        self.assertEqual(state.token_ids, [])
+        self.assertTrue(batch.prefilling)
+        self.assertEqual(batch.prefill(), [])
+        self.assertFalse(batch.prefilling)
+        self.assertEqual(recorded.calls, [('body', 2), ('head', 5)])
+        while batch.size:
+            batch.step()
+        self.assertEqual(state.token_ids, generate_tokens(model, request.prompt_token_ids, set(), 8))
 
     def engine(self, model: LastTokenQwen3) -> InferenceEngine:
         self.enterContext(patch('mlx_nano_llm.engine.load_model',

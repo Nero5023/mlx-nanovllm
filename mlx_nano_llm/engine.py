@@ -179,36 +179,48 @@ class InferenceEngine:
             raise ValueError("chunk_size must be positive.")
         finished: list[ActiveRequest] = []
         if self._prefill_batch is None:
-            count = min(max_requests, len(self._waiting))
-            states: list[ActiveRequest] = []
-            for _ in range(count):
-                request = self._waiting.popleft()
-                states.append(ActiveRequest(request))
-
-            active: list[ActiveRequest] = []
-            for state in states:
-                if state.request.max_tokens == 0:
-                    finished.append(state)
-                else:
-                    active.append(state)
-            if active:
-                pad_token_id: int | None = cast(int | None, self.tokenizer.pad_token_id)
-                self._prefill_batch = BatchState(
-                    self.model, active, self.eos_token_ids,
-                    pad_token_id=pad_token_id if pad_token_id is not None else 0, trace=self.trace,
-                )
+            finished = self._start_prefill(max_requests)
 
         incoming = self._prefill_batch
-        if incoming is not None:
-            finished.extend(incoming.step() if chunk_size is None else incoming.prefill_chunk(chunk_size))
-            if not incoming.prefilling:
-                self._prefill_batch = None
-                if incoming.size:
-                    if self._batch is None:
-                        self._batch = incoming
-                    else:
-                        self._batch.extend(incoming)
+        if incoming is None:
+            return [self._output(state) for state in finished]
+
+        finished.extend(incoming.prefill(chunk_size))
+        if not incoming.prefilling:
+            self._merge_prefilled_batch()
         return [self._output(state) for state in finished]
+
+    def _start_prefill(self, max_requests: int) -> list[ActiveRequest]:
+        """Create the incoming group; return zero-budget requests already complete."""
+        count = min(max_requests, len(self._waiting))
+        finished: list[ActiveRequest] = []
+        active: list[ActiveRequest] = []
+        for _ in range(count):
+            request = self._waiting.popleft()
+            state = ActiveRequest(request)
+            if request.max_tokens == 0:
+                finished.append(state)
+            else:
+                active.append(state)
+
+        if active:
+            pad_token_id: int | None = cast(int | None, self.tokenizer.pad_token_id)
+            self._prefill_batch = BatchState(
+                self.model, active, self.eos_token_ids,
+                pad_token_id=pad_token_id if pad_token_id is not None else 0, trace=self.trace,
+            )
+        return finished
+
+    def _merge_prefilled_batch(self) -> None:
+        """Move surviving incoming rows into decode and release the prefill slot."""
+        incoming = self._prefill_batch
+        self._prefill_batch = None
+        if incoming is None or not incoming.size:
+            return
+        if self._batch is None:
+            self._batch = incoming
+        else:
+            self._batch.extend(incoming)
 
     def step(self) -> list[RequestOutput]:
         """Decode one token per active row; return only newly finished requests."""

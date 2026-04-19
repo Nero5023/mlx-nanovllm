@@ -54,14 +54,19 @@ class BatchState:
     def prefilling(self) -> bool:
         return self._prefill
 
-    def prefill_chunk(self, chunk_size: int) -> list[ActiveRequest]:
-        """Consume at most chunk_size prompt positions per row, sampling only at the end."""
-        if chunk_size < 1:
+    def prefill(self, chunk_size: int | None = None) -> list[ActiveRequest]:
+        """Advance prefill; None processes the whole remaining prompt.
+
+        Intermediate chunks only update KV. The final chunk generates the first
+        output token, completing prefill even if the request needs more decode.
+        """
+        if chunk_size is not None and chunk_size < 1:
             raise ValueError("chunk_size must be positive.")
         if not self._prefill:
             raise ValueError("This batch has already completed prefill.")
-        if self.inputs.shape[1] <= chunk_size:
-            return self.step()
+        remaining_prompt_tokens = self.inputs.shape[1]
+        if chunk_size is None or remaining_prompt_tokens <= chunk_size:
+            return self._generate_next_token()
 
         chunk = self.inputs[:, :chunk_size]
         # Intermediate chunks need only KV updates, not vocabulary logits.
@@ -76,6 +81,10 @@ class BatchState:
 
     def step(self) -> list[ActiveRequest]:
         """Run one forward pass and return the requests that just completed."""
+        return self._generate_next_token()
+
+    def _generate_next_token(self) -> list[ActiveRequest]:
+        """Shared by the final prefill chunk and each subsequent decode step."""
         if not self.active:
             return []
         logits: mx.array = self.model(self.inputs, cache=self.cache)
@@ -157,6 +166,7 @@ def generate_batch_tokens(
     active: list[ActiveRequest] = [state for state in states if state.request.max_tokens > 0]
     if active:
         batch: BatchState = BatchState(model, active, eos_token_ids, pad_token_id=pad_token_id, trace=trace)
+        batch.prefill()
         while batch.size:
             batch.step()
 
