@@ -11,6 +11,7 @@ from mlx_nano_llm.benchmark import BenchmarkStats
 from mlx_nano_llm.batch_infer import ActiveRequest, BatchState, generate_batch_tokens
 from mlx_nano_llm.infer import DEFAULT_MODEL, encode_prompt, generate_tokens
 from mlx_nano_llm.model import load_model
+from mlx_nano_llm.paged_kv import PagedKVAdapter
 from mlx_nano_llm.request import Request, RequestOutput
 from mlx_nano_llm.sampler import GreedySampler, Sampler
 from mlx_nano_llm.telemetry import TokenCallback
@@ -30,7 +31,16 @@ class InferenceEngine:
         use_cache: bool = True,
         trace: bool = False,
         collect_stats: bool = False,
+        paged_kv: bool = False,
+        kv_page_size: int = 16,
+        kv_num_pages: int = 256,
     ) -> None:
+        if paged_kv and not use_cache:
+            raise ValueError('Paged KV requires use_cache=True.')
+        if paged_kv:
+            for name, value in (('kv_page_size', kv_page_size), ('kv_num_pages', kv_num_pages)):
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise ValueError(f'{name} must be a positive integer.')
         loaded_model, config = load_model(model_path)
         self.model: Qwen3Model = cast(Qwen3Model, loaded_model)
         self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
@@ -46,6 +56,11 @@ class InferenceEngine:
         self.use_cache: bool = use_cache
         self.trace: bool = trace
         self.collect_stats: bool = collect_stats
+        self._kv_page_size = kv_page_size
+        self._kv_capacity_tokens = kv_page_size * kv_num_pages
+        # Pools live as long as this engine. Each run_next() starts with empty tables.
+        self._paged_cache = (tuple(PagedKVAdapter(num_pages=kv_num_pages, page_size=kv_page_size)
+                                   for _ in self.model.layers) if paged_kv else None)
         self._waiting: deque[Request] = deque()
         self._next_request_id: int = 0
         self._batch: BatchState | None = None
@@ -80,6 +95,9 @@ class InferenceEngine:
             raise ValueError("The prompt must contain at least one token.")
         if len(prompt_token_ids) + max_tokens > self.max_context_tokens:
             raise ValueError("Prompt plus requested output exceeds the model's context length.")
+        if (self._paged_cache is not None and max_tokens > 0
+                and len(prompt_token_ids) + max_tokens - 1 > self._kv_capacity_tokens):
+            raise MemoryError(f'Request exceeds the paged KV capacity of {self._kv_capacity_tokens} tokens.')
 
         request: Request = Request(
             request_id=self._next_request_id,
@@ -104,7 +122,7 @@ class InferenceEngine:
             return None
         request: Request = self._waiting.popleft()
         stats: BenchmarkStats | None = BenchmarkStats() if self.collect_stats else None
-        # generate_tokens() creates a fresh KV cache local to this request.
+        # Shared paged pools survive; generate_tokens() returns this request's pages.
         token_ids: list[int] = generate_tokens(
             self.model,
             request.prompt_token_ids,
@@ -115,6 +133,9 @@ class InferenceEngine:
             trace=self.trace,
             stats=stats,
             on_token=request.on_token,
+            paged_kv=self._paged_cache is not None,
+            kv_page_size=self._kv_page_size,
+            paged_cache=self._paged_cache,
         )
         text: str = cast(str, self.tokenizer.decode(token_ids, skip_special_tokens=True))
         return RequestOutput(
@@ -145,9 +166,20 @@ class InferenceEngine:
             raise ValueError("max_batch_size must be positive.")
         if not self.use_cache or self.collect_stats:
             raise ValueError("Fixed batches require use_cache=True and collect_stats=False.")
-        requests: list[Request] = [
-            self._waiting.popleft() for _ in range(min(max_batch_size, len(self._waiting)))
-        ]
+        requests: list[Request] = []
+        pages_left = (min(c.storage.pool.free_page_count if c.storage is not None else c.num_pages
+                          for c in self._paged_cache) if self._paged_cache is not None else 0)
+        while self._waiting and len(requests) < max_batch_size:
+            request = self._waiting[0]
+            if self._paged_cache is not None:
+                history = len(request.prompt_token_ids) + request.max_tokens - 1
+                needed = (history + self._kv_page_size - 1) // self._kv_page_size if request.max_tokens else 0
+                if needed > pages_left:
+                    break
+                pages_left -= needed
+            requests.append(self._waiting.popleft())
+        if not requests and self._waiting:
+            raise MemoryError('No waiting request fits the currently free KV pages.')
         if not requests:
             return []
         pad_token_id: int | None = cast(int | None, self.tokenizer.pad_token_id)
@@ -155,6 +187,7 @@ class InferenceEngine:
             self.model, requests, self.eos_token_ids,
             pad_token_id=pad_token_id if pad_token_id is not None else 0,
             trace=self.trace,
+            paged_cache=self._paged_cache,
         )
         return [RequestOutput(
             request_id=request.request_id, prompt=request.prompt,
@@ -173,6 +206,8 @@ class InferenceEngine:
         """
         if max_requests < 1:
             raise ValueError("max_requests must be positive.")
+        if self._paged_cache is not None:
+            raise ValueError('Paged KV supports fixed run_batch(), not continuous/chunked prefill.')
         if not self.use_cache or self.collect_stats:
             raise ValueError("Batching requires use_cache=True and collect_stats=False.")
         if chunk_size is not None and chunk_size < 1:
@@ -235,6 +270,8 @@ class InferenceEngine:
         """Discard active state after a shared inference failure."""
         self._batch = None
         self._prefill_batch = None
+        if self._paged_cache is not None:
+            self._waiting.clear()
 
     def _output(self, state: ActiveRequest) -> RequestOutput:
         return RequestOutput(

@@ -150,6 +150,26 @@ class PagedInferenceTests(unittest.TestCase):
         assert cache.storage is not None
         self.assertTrue(mx.array_equal(cache.storage.gather()[0], mx.ones((2, 1, 4))).item())
 
+    def test_shared_cache_capacity_is_checked_for_all_layers_before_any_write(self) -> None:
+        caches = (PagedKVAdapter(num_pages=4, page_size=2),
+                  PagedKVAdapter(num_pages=1, page_size=2))
+        with self.assertRaises(MemoryError):
+            generate_tokens(tiny_model(), [1, 2, 3], set(), 3, paged_kv=True,
+                            kv_page_size=2, paged_cache=caches)
+        self.assertTrue(all(cache.storage is None for cache in caches))
+
+    def test_shared_cache_with_existing_history_is_rejected_without_clearing_it(self) -> None:
+        caches = [PagedKVAdapter(num_pages=4, page_size=2) for _ in range(2)]
+        keys = mx.ones((1, 1, 1, 4))
+        caches[0].update_and_fetch(keys, keys)
+        with self.assertRaisesRegex(ValueError, 'empty paged caches'):
+            generate_tokens(tiny_model(), [1, 2, 3], set(), 3, paged_kv=True,
+                            kv_page_size=2, paged_cache=caches)
+        self.assertEqual(caches[0].offset, 1)
+        assert caches[0].storage is not None
+        self.assertEqual(caches[0].storage.pool.used_page_count, 1)
+        caches[0].clear()
+
 
 if __name__ == '__main__':
     unittest.main()

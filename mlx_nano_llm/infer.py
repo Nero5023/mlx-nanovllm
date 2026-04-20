@@ -1,6 +1,7 @@
 """One prompt, greedy decoding, and an optional KV cache on MLX."""
 
 import argparse
+from collections.abc import Sequence
 import json
 import sys
 from pathlib import Path
@@ -49,12 +50,15 @@ def generate_tokens(
     on_token: TokenCallback | None = None,
     paged_kv: bool = False,
     kv_page_size: int = 16,
+    paged_cache: Sequence[PagedKVAdapter] | None = None,
 ) -> list[int]:
     """Return new token IDs, excluding the prompt and the stop token.
 
     Sampler.sample receives [batch, vocabulary] logits and returns [batch] integer
     token IDs. Defaults to a fresh GreedySampler. The loop handles batch=1.
-    paged_kv enables request-owned paged storage with gather + existing attention.
+    paged_kv enables paged storage with gather + existing attention. Optional
+    paged_cache reuses empty engine-owned layer caches; pages are returned after
+    this request, while the supplied pools remain available for later requests.
     """
     if not prompt_token_ids:
         raise ValueError("The prompt must contain at least one token.")
@@ -65,6 +69,15 @@ def generate_tokens(
         raise ValueError('paged_kv requires use_cache=True.')
     if not isinstance(kv_page_size, int) or isinstance(kv_page_size, bool) or kv_page_size < 1:
         raise ValueError('kv_page_size must be a positive integer.')
+    if paged_cache is not None:
+        if not paged_kv:
+            raise ValueError('paged_cache requires paged_kv=True.')
+        if len(paged_cache) != len(model.layers):
+            raise ValueError('paged_cache must contain one cache per model layer.')
+        if any(cache.offset != 0 for cache in paged_cache):
+            raise ValueError('Each request must start with empty paged caches.')
+        if any(cache.page_size != kv_page_size for cache in paged_cache):
+            raise ValueError('Shared caches must use kv_page_size.')
 
     if sampler is None:
         sampler = GreedySampler()
@@ -83,8 +96,17 @@ def generate_tokens(
             # The final sampled token never enters KV: prefill + at most N-1 decode inputs.
             capacity_tokens = len(prompt_token_ids) + max_tokens - 1
             num_pages = (capacity_tokens + kv_page_size - 1) // kv_page_size
-            paged_caches = [PagedKVAdapter(num_pages=num_pages, page_size=kv_page_size)
-                            for _ in model.layers]
+            if paged_cache is None:
+                paged_caches = [PagedKVAdapter(num_pages=num_pages, page_size=kv_page_size)
+                                for _ in model.layers]
+            else:
+                # Check every layer before writing any KV for the new request.
+                for layer_cache in paged_cache:
+                    available = (layer_cache.storage.pool.free_page_count
+                                 if layer_cache.storage is not None else layer_cache.num_pages)
+                    if num_pages > available:
+                        raise MemoryError(f'Request needs {num_pages} KV pages per layer; only {available} free.')
+                paged_caches = list(paged_cache)
             cache = paged_caches
         elif not paged_kv:
             cache = make_prompt_cache(model)

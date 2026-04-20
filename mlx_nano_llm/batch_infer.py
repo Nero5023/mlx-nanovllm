@@ -1,6 +1,7 @@
 """A resumable batch: prefill, decode one step, compact, and merge new rows."""
 
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import cast
@@ -10,6 +11,7 @@ from mlx_lm.models.cache import BatchKVCache
 from mlx_lm.models.qwen3 import Model as Qwen3Model
 
 from mlx_nano_llm.request import Request
+from mlx_nano_llm.paged_kv import PagedBatchKVCache, PagedKVAdapter
 from mlx_nano_llm.sampler import GreedySampler
 from mlx_nano_llm.telemetry import TokenEvent
 
@@ -31,6 +33,7 @@ class BatchState:
     def __init__(
         self, model: Qwen3Model, active: list[ActiveRequest], eos_token_ids: set[int],
         *, pad_token_id: int = 0, trace: bool = False,
+        paged_cache: Sequence[PagedKVAdapter] | None = None,
     ) -> None:
         self.model: Qwen3Model = model
         self.active: list[ActiveRequest] = list(active)
@@ -44,7 +47,13 @@ class BatchState:
             [pad_token_id] * padding + row.request.prompt_token_ids
             for padding, row in zip(left_padding, active, strict=True)
         ], dtype=mx.int32)
-        self.cache: list[BatchKVCache] = [BatchKVCache(left_padding) for _ in model.layers]
+        self.cache: list[BatchKVCache] | list[PagedBatchKVCache]
+        if paged_cache is None:
+            self.cache = [BatchKVCache(left_padding) for _ in model.layers]
+        else:
+            if len(paged_cache) != len(model.layers):
+                raise ValueError('Paged caches must match model layers.')
+            self.cache = [PagedBatchKVCache(owner, left_padding) for owner in paged_cache]
 
     @property
     def size(self) -> int:
@@ -64,6 +73,8 @@ class BatchState:
             raise ValueError("chunk_size must be positive.")
         if not self._prefill:
             raise ValueError("This batch has already completed prefill.")
+        if chunk_size is not None and any(isinstance(c, PagedBatchKVCache) for c in self.cache):
+            raise ValueError('Paged batches do not yet support chunked prefill.')
         remaining_prompt_tokens = self.inputs.shape[1]
         if chunk_size is None or remaining_prompt_tokens <= chunk_size:
             return self._generate_next_token()
@@ -131,8 +142,14 @@ class BatchState:
         self.active = [self.active[row] for row in keep_rows]
         self.inputs = mx.array([[token_ids[row]] for row in keep_rows], dtype=mx.int32)
         if not self.active:
-            self.cache = []  # Do not retain a finished group's KV allocation.
+            self.close()
         return finished
+
+    def close(self) -> None:
+        for cache in self.cache:
+            if isinstance(cache, PagedBatchKVCache):
+                cache.clear()
+        self.cache = []
 
     def extend(self, other: "BatchState") -> None:
         """Append prefilled rows; MLX aligns their KV lengths with left padding."""
@@ -141,6 +158,8 @@ class BatchState:
         if not self.size or self._prefill or other._prefill:
             raise ValueError("Only nonempty, prefilled batches can merge.")
         for cache, incoming in zip(self.cache, other.cache, strict=True):
+            if isinstance(cache, PagedBatchKVCache) or isinstance(incoming, PagedBatchKVCache):
+                raise ValueError('Paged batches do not yet support joining new rows.')
             # incoming do the padding here
             cache.extend(incoming)
         self.inputs = mx.concatenate([self.inputs, other.inputs], axis=0)
@@ -157,6 +176,7 @@ def generate_batch_tokens(
     *,
     pad_token_id: int = 0,
     trace: bool = False,
+    paged_cache: Sequence[PagedKVAdapter] | None = None,
 ) -> list[list[int]]:
     """Complete one group, returning output IDs in the original request order."""
     for request in requests:
@@ -165,9 +185,13 @@ def generate_batch_tokens(
     states: list[ActiveRequest] = [ActiveRequest(request) for request in requests]
     active: list[ActiveRequest] = [state for state in states if state.request.max_tokens > 0]
     if active:
-        batch: BatchState = BatchState(model, active, eos_token_ids, pad_token_id=pad_token_id, trace=trace)
-        batch.prefill()
-        while batch.size:
-            batch.step()
+        batch = BatchState(model, active, eos_token_ids, pad_token_id=pad_token_id,
+                           trace=trace, paged_cache=paged_cache)
+        try:
+            batch.prefill()
+            while batch.size:
+                batch.step()
+        finally:
+            batch.close()
 
     return [state.token_ids for state in states]

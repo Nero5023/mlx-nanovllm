@@ -174,7 +174,8 @@ class InferenceClientTests(unittest.IsolatedAsyncioTestCase):
         self.state: EngineState = EngineState()
 
         def create_engine(
-            model_path: Path, *, use_cache: bool, trace: bool, collect_stats: bool
+            model_path: Path, *, use_cache: bool, trace: bool, collect_stats: bool,
+            paged_kv: bool, kv_page_size: int, kv_num_pages: int,
         ) -> FakeEngine:
             return FakeEngine(self.state)
 

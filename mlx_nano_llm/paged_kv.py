@@ -8,6 +8,7 @@ from collections import deque
 
 import mlx.core as mx
 from mlx_lm.models.cache import create_attention_mask
+from mlx_lm.models.base import create_causal_mask
 
 
 class KVPagePool:
@@ -127,7 +128,7 @@ class PagedKVAdapter:
 
     Allocate a request-owned pool on the first write so its dtype matches actual
     model activations, including quantized models. This is a reference path, not
-    direct paged attention. BatchState's batched/chunked caches do not use it yet.
+    direct paged attention. Fixed batches share this pool via PagedBatchKVCache.
     """
 
     def __init__(self, *, num_pages: int, page_size: int) -> None:
@@ -157,11 +158,8 @@ class PagedKVAdapter:
             raise ValueError('PagedKVAdapter requires matching single-request [1, heads, tokens, dim] K/V.')
         if keys.dtype != values.dtype:
             raise ValueError('Keys and values must have the same dtype.')
-        if self.storage is None:
-            self.storage = PagedKVCache(KVPagePool(
-                num_pages=self.num_pages, page_size=self.page_size,
-                num_kv_heads=keys.shape[1], head_dim=keys.shape[3], dtype=keys.dtype,
-            ))
+        self._get_pool(keys)
+        assert self.storage is not None
         # Storage is token-major; Qwen3 attention uses head-major tensors.
         self.storage.append(keys[0].transpose(1, 0, 2), values[0].transpose(1, 0, 2))
         gathered_keys, gathered_values = self.storage.gather()
@@ -171,3 +169,87 @@ class PagedKVAdapter:
     def clear(self) -> None:
         if self.storage is not None:
             self.storage.clear()
+
+    def _get_pool(self, keys: mx.array) -> KVPagePool:
+        if self.storage is None:
+            self.storage = PagedKVCache(KVPagePool(
+                num_pages=self.num_pages, page_size=self.page_size,
+                num_kv_heads=keys.shape[1], head_dim=keys.shape[3], dtype=keys.dtype,
+            ))
+        return self.storage.pool
+
+
+class PagedBatchKVCache:
+    """One layer of a fixed batch: independent row tables share the engine's pool.
+
+    Only real prompt tokens enter pages. Gather temporarily left-pads histories
+    for existing attention; filter releases completed rows without moving KV.
+    """
+
+    def __init__(self, owner: PagedKVAdapter, left_padding: list[int]) -> None:
+        self.owner = owner
+        self.rows: list[PagedKVCache] = []
+        self._padding = left_padding
+
+    @property
+    def offset(self) -> mx.array:
+        return mx.array([row.length for row in self.rows] if self.rows
+                        else [-pad for pad in self._padding])
+
+    @property
+    def _width(self) -> int:
+        return max((row.length for row in self.rows), default=0)
+
+    @property
+    def left_padding(self) -> mx.array:
+        return mx.array([self._width - row.length for row in self.rows] if self.rows else self._padding)
+
+    @property
+    def state(self) -> tuple[mx.array, ...]:
+        return self.owner.state
+
+    def make_mask(self, N: int, return_array: bool = False, window_size: int | None = None):
+        return create_causal_mask(N, offset=self._width, left_padding=self.left_padding,
+                                  window_size=window_size)
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
+        first = not self.rows
+        if keys.ndim != 4 or keys.shape != values.shape or keys.dtype != values.dtype:
+            raise ValueError('Batched K/V must have matching [batch, heads, tokens, dim] shape and dtype.')
+        if keys.shape[0] != len(self._padding):
+            raise ValueError('KV rows must match the current batch.')
+        if first and any(pad < 0 or pad >= keys.shape[2] for pad in self._padding):
+            raise ValueError('Each fixed-batch prompt must contain real tokens.')
+        pool = self.owner._get_pool(keys)
+        if first:
+            self.rows = [PagedKVCache(pool) for _ in self._padding]
+        starts = self._padding if first else [0] * len(self.rows)
+        needed = sum((row.length + keys.shape[2] - start + pool.page_size - 1) // pool.page_size
+                     - len(row.block_table) for row, start in zip(self.rows, starts, strict=True))
+        if needed > pool.free_page_count:
+            raise MemoryError('Insufficient KV pages for the batch update.')
+        for i, (row, start) in enumerate(zip(self.rows, starts, strict=True)):
+            row.append(keys[i, :, start:, :].transpose(1, 0, 2),
+                       values[i, :, start:, :].transpose(1, 0, 2))
+        gathered_keys, gathered_values = [], []
+        width = self._width
+        for row in self.rows:
+            k, v = row.gather()
+            padding = [(width - row.length, 0), (0, 0), (0, 0)]
+            gathered_keys.append(mx.pad(k, padding).transpose(1, 0, 2))
+            gathered_values.append(mx.pad(v, padding).transpose(1, 0, 2))
+        return mx.stack(gathered_keys), mx.stack(gathered_values)
+
+    def filter(self, keep_rows: list[int]) -> None:
+        keep = set(keep_rows)
+        for i, row in enumerate(self.rows):
+            if i not in keep:
+                row.clear()
+        self.rows = [self.rows[i] for i in keep_rows]
+        self._padding = [self._padding[i] for i in keep_rows]
+
+    def clear(self) -> None:
+        for row in self.rows:
+            row.clear()
+        self.rows = []
+        self._padding = []

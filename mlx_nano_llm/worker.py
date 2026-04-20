@@ -55,6 +55,9 @@ class InferenceWorker:
         max_batch_size: int = 1,
         batch_wait_ms: float = 2.0,
         prefill_chunk_size: int | None = None,
+        paged_kv: bool = False,
+        kv_page_size: int = 16,
+        kv_num_pages: int = 256,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be positive.")
@@ -64,6 +67,15 @@ class InferenceWorker:
             raise ValueError("prefill_chunk_size must be positive.")
         if (max_batch_size > 1 or prefill_chunk_size is not None) and (not use_cache or collect_stats):
             raise ValueError("Batching requires use_cache=True and collect_stats=False.")
+        if paged_kv:
+            if not use_cache or prefill_chunk_size is not None:
+                raise ValueError('Paged KV serving requires caching and no chunked prefill.')
+            for name, value in (('kv_page_size', kv_page_size), ('kv_num_pages', kv_num_pages)):
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise ValueError(f'{name} must be a positive integer.')
+        self._paged_kv = paged_kv
+        self._kv_page_size = kv_page_size
+        self._kv_num_pages = kv_num_pages
         self._max_batch_size: int = max_batch_size
         self._prefill_chunk_size = prefill_chunk_size
         self._batch_wait_seconds: float = batch_wait_ms / 1000
@@ -153,7 +165,8 @@ class InferenceWorker:
     ) -> None:
         try:
             engine: InferenceEngine = InferenceEngine(
-                model_path, use_cache=use_cache, trace=trace, collect_stats=collect_stats
+                model_path, use_cache=use_cache, trace=trace, collect_stats=collect_stats,
+                paged_kv=self._paged_kv, kv_page_size=self._kv_page_size, kv_num_pages=self._kv_num_pages,
             )
         except BaseException as error:
             self._fail_startup(error)
@@ -161,7 +174,7 @@ class InferenceWorker:
             return
         self._ready.set_result(None)
 
-        if self._max_batch_size > 1 or self._prefill_chunk_size is not None:
+        if not self._paged_kv and (self._max_batch_size > 1 or self._prefill_chunk_size is not None):
             self._run_continuous(engine)
             return
         deferred: deque[_MemoryProbe | None] = deque()
@@ -320,12 +333,21 @@ class InferenceWorker:
         if not running:
             return
         try:
-            output: RequestOutput | None = engine.run_next()
-            outputs: list[RequestOutput] = [output] if output is not None else []
+            outputs: list[RequestOutput] = []
+            if self._paged_kv and self._max_batch_size > 1:
+                # Fixed admission group; capacity can split it into smaller FIFO batches.
+                while engine.pending_requests:
+                    outputs.extend(engine.run_batch(self._max_batch_size))
+            else:
+                output = engine.run_next()
+                if output is not None:
+                    outputs.append(output)
             if len(outputs) != len(running):
                 raise RuntimeError("The submitted requests produced an incomplete batch.")
         except BaseException as error:
             # A shared model failure affects this batch; later batches can still run.
+            if self._paged_kv:
+                engine.abort_batch()
             for item in running:
                 item.future.set_exception(error)
         else:
