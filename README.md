@@ -98,6 +98,103 @@ See the [chunked-prefill validation](reports/chunked-prefill/README.md).
 Every iteration advances existing requests even if incoming short requests keep
 arriving; the scheduler does not continually prefill without decoding.
 
+## Paged KV reference path
+
+`mlx_nano_llm/paged_kv.py` provides a standalone, single-layer page pool and
+per-sequence page tables. Single-request generation can now use paged storage
+through `PagedKVAdapter`, which gathers valid K/V before existing MLX attention:
+
+```bash
+uv run python -m mlx_nano_llm.infer "What is the capital of France?" \
+  --paged-kv --kv-page-size 16 --max-tokens 32 --trace
+```
+
+The Python entry point is `generate_tokens(..., paged_kv=True, kv_page_size=16)`.
+Direct generation/CLI creates private pools sized for prompt tokens plus at most
+`max_tokens - 1` decode inputs. Dtype comes from the actual first K/V write. The
+[real-model validation](reports/paged-kv-gather/README.md) records logits, KV and
+complete-output comparisons.
+
+Serial serving can instead reuse engine-owned pools across requests:
+
+```python
+from mlx_nano_llm.client import InferenceClient
+
+async with InferenceClient(paged_kv=True, kv_page_size=16, kv_num_pages=256) as client:
+    first = await client.generate("What is the capital of France?", 32)
+    second = await client.generate("What is 2 + 2?", 16)
+```
+
+`InferenceEngine` accepts the same three options for `run_next()`, `run()` and
+fixed-group `run_batch()`.
+Each layer's pool keeps its identity for the engine lifetime. Completion, EOS
+or an inference/callback exception returns the request's pages and resets its
+logical offset; later requests reuse the space, not the preceding request's KV
+contents. The capacity per layer is `kv_page_size * kv_num_pages` (4096 tokens
+with these defaults). Requests exceeding their worst-case history capacity fail
+before entering the engine queue; async callers receive the error through their
+request future. Zero-output requests need no pages. Pool tensors allocate lazily
+on first use and remain reserved across requests; free pages do not mean memory
+has returned to the OS.
+
+Paged serving requires `use_cache=True` and `prefill_chunk_size=None`;
+incompatible options are rejected. Queued cancellation
+skips model work. Cancellation after admission discards the caller's result while
+generation finishes, then returns pages, matching the existing worker policy.
+Close drains admitted work. See the [shared-pool validation](reports/paged-kv-serving/README.md).
+
+For a fixed paged batch, set `max_batch_size` above one:
+
+```python
+async with InferenceClient(paged_kv=True, max_batch_size=4,
+                           kv_page_size=16, kv_num_pages=256) as client:
+    outputs = await asyncio.gather(
+        client.generate("What is the capital of France?", 32),
+        client.generate("Count from 1 to 10.", 64),
+    )
+```
+
+This path reuses `BatchState` for sampling/EOS/row compaction. Each row stores
+only valid tokens in its own page table; gather temporarily left-pads histories
+for existing attention. Completed rows free their pages without relocating
+survivors. Before starting a batch, the engine admits the largest FIFO prefix
+whose worst-case page needs fit the pool, so a request can finish without waiting
+for another row to release pages. Capacity can reduce actual batch size.
+
+This is fixed-group serving: new arrivals wait for the admitted group, and final
+futures are delivered after the collected group completes, even if its execution
+splits into smaller batches. Existing non-paged serving keeps continuous refill.
+See the [fixed paged-batch validation](reports/paged-kv-batch/README.md).
+Dynamic paged admission, chunked prefill and direct paged-attention kernels remain
+later steps. The current gather path has no performance or zero-copy guarantee.
+
+The underlying single-layer storage can also be inspected independently:
+
+```python
+from mlx_nano_llm.paged_kv import KVPagePool, PagedKVCache
+
+pool = KVPagePool(num_pages=64, page_size=16, num_kv_heads=8, head_dim=128)
+cache = PagedKVCache(pool)
+cache.append(keys, values)  # Both arrays: [tokens, KV heads, head dim], matching pool dtype.
+print(cache.block_table)   # Logical page -> physical page ID.
+print(cache.slot_mapping())  # Logical token -> flattened physical slot.
+reference_keys, reference_values = cache.gather()
+cache.clear()             # Explicitly return pages when the sequence finishes.
+```
+
+Sequences can grow across non-contiguous pages while existing logical pages keep
+their physical IDs. Freed pages are reused, and insufficient page capacity is detected before
+allocation changes the sequence. Partial final pages expose only valid tokens.
+Pages are exclusive: prefix sharing and copy-on-write are not implemented.
+The pool reserves fixed-capacity MLX arrays; used-page counts are distinct from
+reserved tensor memory. Writes use ordinary lazy MLX indexing, with no guarantee
+of in-place execution. `gather()` materializes contiguous K/V for validation; a
+future direct paged-attention kernel must consume the pages and table themselves.
+
+Run the storage tests with `uv run python -m unittest tests.test_paged_kv -v`.
+
+## Batch state
+
 In [batch_infer.py](mlx_nano_llm/batch_infer.py), `BatchState` retains state between steps:
 
 1. Left-pads the prompts to `[batch, longest_prompt]`. Each row's final position

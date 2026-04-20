@@ -25,11 +25,15 @@ class InferenceClient:
         max_batch_size: int = 1,
         batch_wait_ms: float = 2.0,
         prefill_chunk_size: int | None = None,
+        paged_kv: bool = False,
+        kv_page_size: int = 16,
+        kv_num_pages: int = 256,
     ) -> None:
         self._worker: InferenceWorker = InferenceWorker(
             model_path, use_cache=use_cache, trace=trace, collect_stats=collect_stats,
             max_batch_size=max_batch_size, batch_wait_ms=batch_wait_ms,
             prefill_chunk_size=prefill_chunk_size,
+            paged_kv=paged_kv, kv_page_size=kv_page_size, kv_num_pages=kv_num_pages,
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._started: bool = False

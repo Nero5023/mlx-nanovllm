@@ -1,0 +1,338 @@
+{
+  "page_size": 16,
+  "pages_per_layer": 16,
+  "engine_instances": 1,
+  "worker_stopped": true,
+  "groups": [
+    {
+      "request_ids": [
+        0,
+        1,
+        2
+      ],
+      "batch_rows": 3,
+      "pool_identity_reused": true,
+      "free_pages_after": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ]
+    },
+    {
+      "request_ids": [
+        3,
+        4,
+        5
+      ],
+      "batch_rows": 3,
+      "pool_identity_reused": true,
+      "free_pages_after": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ]
+    }
+  ],
+  "row_release_events_layer_0": [
+    {
+      "rows_before": 3,
+      "rows_after": 2,
+      "pages_returned": 5,
+      "surviving_tables_unchanged": true,
+      "surviving_tables": [
+        [
+          0,
+          1,
+          2,
+          3,
+          12
+        ],
+        [
+          4,
+          5,
+          6,
+          13
+        ]
+      ]
+    },
+    {
+      "rows_before": 2,
+      "rows_after": 1,
+      "pages_returned": 5,
+      "surviving_tables_unchanged": true,
+      "surviving_tables": [
+        [
+          4,
+          5,
+          6,
+          13
+        ]
+      ]
+    },
+    {
+      "rows_before": 3,
+      "rows_after": 2,
+      "pages_returned": 5,
+      "surviving_tables_unchanged": true,
+      "surviving_tables": [
+        [
+          10,
+          11,
+          0,
+          4
+        ],
+        [
+          1,
+          2,
+          3,
+          12,
+          5
+        ]
+      ]
+    },
+    {
+      "rows_before": 2,
+      "rows_after": 1,
+      "pages_returned": 5,
+      "surviving_tables_unchanged": true,
+      "surviving_tables": [
+        [
+          10,
+          11,
+          0,
+          4
+        ]
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "order": [
+        0,
+        1,
+        2
+      ],
+      "prompt_lengths": [
+        63,
+        47,
+        65
+      ],
+      "complete_output_matches": [
+        true,
+        true,
+        true
+      ],
+      "contiguous_token_ids": [
+        [
+          785,
+          3897,
+          821,
+          374,
+          32143,
+          323,
+          7952,
+          311
+        ],
+        [
+          16,
+          13,
+          220,
+          17,
+          13,
+          220,
+          18,
+          13,
+          151645,
+          198,
+          151643,
+          33975,
+          25,
+          3555,
+          374,
+          279
+        ],
+        [
+          16,
+          13,
+          2303,
+          17
+        ]
+      ],
+      "paged_token_ids": [
+        [
+          785,
+          3897,
+          821,
+          374,
+          32143,
+          323,
+          7952,
+          311
+        ],
+        [
+          16,
+          13,
+          220,
+          17,
+          13,
+          220,
+          18,
+          13,
+          151645,
+          198,
+          151643,
+          33975,
+          25,
+          3555,
+          374,
+          279
+        ],
+        [
+          16,
+          13,
+          2303,
+          17
+        ]
+      ]
+    },
+    {
+      "order": [
+        2,
+        1,
+        0
+      ],
+      "prompt_lengths": [
+        65,
+        47,
+        63
+      ],
+      "complete_output_matches": [
+        true,
+        true,
+        true
+      ],
+      "contiguous_token_ids": [
+        [
+          16,
+          13,
+          2303,
+          17
+        ],
+        [
+          16,
+          13,
+          220,
+          17,
+          13,
+          220,
+          18,
+          13,
+          151645,
+          198,
+          151643,
+          33975,
+          25,
+          3555,
+          374,
+          279
+        ],
+        [
+          785,
+          3897,
+          821,
+          374,
+          32143,
+          323,
+          7952,
+          311
+        ]
+      ],
+      "paged_token_ids": [
+        [
+          16,
+          13,
+          2303,
+          17
+        ],
+        [
+          16,
+          13,
+          220,
+          17,
+          13,
+          220,
+          18,
+          13,
+          151645,
+          198,
+          151643,
+          33975,
+          25,
+          3555,
+          374,
+          279
+        ],
+        [
+          785,
+          3897,
+          821,
+          374,
+          32143,
+          323,
+          7952,
+          311
+        ]
+      ]
+    }
+  ]
+}
